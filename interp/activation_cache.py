@@ -103,11 +103,28 @@ def log_device_choice() -> str:
 _MODEL_CACHE: dict[str, HookedTransformer] = {}
 
 
-def load_model(device: str | None = None) -> HookedTransformer:
-    """Load the PoC model via TransformerLens (cached per-process)."""
+def _default_dtype(device: str) -> torch.dtype:
+    """Half precision on GPU to avoid the CPU-RAM spike that OOM-kills free
+    Colab during loading (a 1B model in fp32 briefly needs ~10 GB while
+    TransformerLens processes weights). fp32 on CPU for numerical stability."""
+    if device == "cpu":
+        return torch.float32
+    return torch.float16  # T4 (Turing) lacks native bf16; fp16 is the safe GPU choice
+
+
+def load_model(device: str | None = None, dtype: torch.dtype | None = None) -> HookedTransformer:
+    """Load the PoC model via TransformerLens (cached per-process).
+
+    Loads in half precision on GPU (set VERITAS_DTYPE=float32 to override) so the
+    weight-processing step does not exhaust Colab's ~12 GB system RAM.
+    """
     device = device or get_device()
+    if dtype is None:
+        env_dtype = os.environ.get("VERITAS_DTYPE")
+        dtype = getattr(torch, env_dtype) if env_dtype else _default_dtype(device)
+
     if device not in _MODEL_CACHE:
-        model = HookedTransformer.from_pretrained(MODEL_NAME, device=device)
+        model = HookedTransformer.from_pretrained(MODEL_NAME, device=device, dtype=dtype)
         model.eval()
         _MODEL_CACHE[device] = model
     return _MODEL_CACHE[device]
