@@ -50,21 +50,54 @@ ACT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_device() -> str:
-    """Use GPU only if it has enough VRAM for a 1B forward+backward; else CPU.
+    """Pick compute device: CUDA on Colab/big GPUs, CPU only on small local VRAM.
 
-    On Colab (T4/A100) this selects CUDA and runs fast; on a 4 GB local card it
-    falls back to CPU to avoid OOM during the attribution-patching backward pass.
+    Colab shows "connected to GPU but not utilizing it" when the model runs on
+    CPU — usually because cuda wasn't visible yet (restart runtime after enabling
+    GPU) or an old repo version forced CPU.
     """
     override = os.environ.get("VERITAS_DEVICE")
     if override:
         return override
-    if torch.cuda.is_available():
-        try:
-            if torch.cuda.get_device_properties(0).total_memory >= MIN_GPU_BYTES:
-                return "cuda"
-        except Exception:
-            pass
+
+    if not torch.cuda.is_available():
+        return "cpu"
+
+    try:
+        vram = torch.cuda.get_device_properties(0).total_memory
+        name = torch.cuda.get_device_name(0)
+    except Exception:
+        return "cpu"
+
+    # Colab GPU runtime: always use the GPU when CUDA is visible.
+    if os.environ.get("COLAB_RELEASE_TAG"):
+        return "cuda"
+
+    if vram >= MIN_GPU_BYTES:
+        return "cuda"
+
+    # Small local GPU (e.g. 4 GB GTX 1650): CPU avoids OOM on backward pass.
+    print(
+        f"Note: {name} has {vram / 1e9:.1f} GB VRAM (< {MIN_GPU_BYTES / 1e9:.0f} GB "
+        f"threshold) — using CPU. Set VERITAS_DEVICE=cuda to force GPU anyway.",
+        flush=True,
+    )
     return "cpu"
+
+
+def log_device_choice() -> str:
+    """Print diagnostics so Colab users can confirm GPU is actually in use."""
+    dev = get_device()
+    print(f"torch.cuda.is_available() = {torch.cuda.is_available()}", flush=True)
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        print(
+            f"GPU: {torch.cuda.get_device_name(0)} "
+            f"({props.total_memory / 1e9:.1f} GB)",
+            flush=True,
+        )
+    print(f"Veritas selected device: {dev}", flush=True)
+    return dev
 
 
 _MODEL_CACHE: dict[str, HookedTransformer] = {}

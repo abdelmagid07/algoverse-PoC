@@ -27,7 +27,7 @@ from agent.trace_logger import log_trajectory  # noqa: E402
 from analysis.correlate import main as correlate_main  # noqa: E402
 from analysis.summarize import main as summarize_main  # noqa: E402
 from analysis.visualize import main as visualize_main  # noqa: E402
-from interp.activation_cache import LAYER, RESULTS_DIR, load_model  # noqa: E402
+from interp.activation_cache import LAYER, RESULTS_DIR, load_model, log_device_choice  # noqa: E402
 from interp.attribution_patch import attribution_patch_scores  # noqa: E402
 from interp.attribution_patch import OUT_PATH as FAST_PATH  # noqa: E402
 from interp.ground_truth_patch import ground_truth_patch_scores  # noqa: E402
@@ -105,6 +105,7 @@ def main() -> None:
     _log("Veritas PoC pipeline — single process, incremental checkpoints.")
     _log("Do not start another cell/script while this runs (Colab auto-sends ^C).")
 
+    log_device_choice()
     model = load_model()
     _log(
         f"Model: {model.cfg.model_name} on {model.cfg.device} "
