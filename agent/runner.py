@@ -230,26 +230,29 @@ def run_trajectory(model, example: dict) -> dict:
 def main() -> None:
     model = load_model()
     print(f"Loaded {model.cfg.model_name} on {model.cfg.device} "
-          f"({model.cfg.n_layers} layers, d_model={model.cfg.d_model})")
+          f"({model.cfg.n_layers} layers, d_model={model.cfg.d_model})", flush=True)
 
+    print("Loading HotpotQA sample...", flush=True)
     examples = ensure_dataset()
-    print(f"Collecting {len(examples)} trajectories...")
+    print(f"Collecting {len(examples)} trajectories...", flush=True)
 
     trajectories = []
     for i, ex in enumerate(examples):
+        print(f"  [{i+1}/{len(examples)}] generating...", flush=True)
         traj = run_trajectory(model, ex)
+        print(f"  [{i+1}/{len(examples)}] caching activations...", flush=True)
         log_trajectory(model, traj)  # caches residual stream to disk
         trajectories.append(traj)
+        # Checkpoint so a Colab interrupt does not lose all progress.
+        with open(TRAJ_PATH, "w", encoding="utf-8") as f:
+            json.dump(trajectories, f, indent=2)
         print(f"  [{i+1}/{len(examples)}] steps={len(traj['step_positions'])} "
-              f"success={traj['success']} answer={traj['generated_answer']!r}")
-
-    with open(TRAJ_PATH, "w", encoding="utf-8") as f:
-        json.dump(trajectories, f, indent=2)
+              f"success={traj['success']} answer={traj['generated_answer']!r}", flush=True)
 
     n_success = sum(t["success"] for t in trajectories)
-    print(f"\nSaved {len(trajectories)} trajectories to {TRAJ_PATH}")
+    print(f"\nSaved {len(trajectories)} trajectories to {TRAJ_PATH}", flush=True)
     print(f"Success: {n_success}/{len(trajectories)}  |  "
-          f"steps/traj: {[len(t['step_positions']) for t in trajectories]}")
+          f"steps/traj: {[len(t['step_positions']) for t in trajectories]}", flush=True)
 
 
 if __name__ == "__main__":

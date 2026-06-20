@@ -71,7 +71,7 @@ _MODEL_CACHE: dict[str, HookedTransformer] = {}
 
 
 def load_model(device: str | None = None) -> HookedTransformer:
-    """Load GPT-2-small via TransformerLens (cached per-process)."""
+    """Load the PoC model via TransformerLens (cached per-process)."""
     device = device or get_device()
     if device not in _MODEL_CACHE:
         model = HookedTransformer.from_pretrained(MODEL_NAME, device=device)

@@ -37,9 +37,13 @@ the gold answer**, read at the final position of one forward pass over
 ## Run on Google Colab (recommended — GPU)
 
 Open `notebooks/colab_veritas.ipynb` in Colab (set runtime to a T4 GPU). It
-clones this repo, installs deps, logs into Hugging Face, and runs the whole
-pipeline on the GPU. Device selection is automatic: GPU when it has enough VRAM,
-otherwise CPU.
+clones this repo, installs deps, logs into Hugging Face, and runs **`run_pipeline.py`**
+in one process (model loads once; checkpoints after each trajectory so Colab
+interrupts are recoverable).
+
+**Colab tip:** if you see `^C` without pressing anything, Colab usually killed
+the previous cell because another cell started, or the runtime disconnected.
+Re-run the pipeline cell — it resumes from `results/trajectories.json`.
 
 ## Pipeline (run in order, locally)
 
