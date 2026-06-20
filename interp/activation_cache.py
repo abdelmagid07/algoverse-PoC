@@ -116,7 +116,12 @@ def load_model(device: str | None = None, dtype: torch.dtype | None = None) -> H
     """Load the PoC model via TransformerLens (cached per-process).
 
     Loads in half precision on GPU (set VERITAS_DTYPE=float32 to override) so the
-    weight-processing step does not exhaust Colab's ~12 GB system RAM.
+    model fits in VRAM. In reduced precision we use `from_pretrained_no_processing`,
+    which skips the LayerNorm-folding / weight-centering step that otherwise spikes
+    CPU RAM past Colab's ~12 GB limit (this is exactly what TransformerLens warns
+    to do for reduced precision). The residual-stream hooks both patching methods
+    rely on are unaffected; only interpretability-convenience weight rewrites are
+    skipped, and both methods use the same model so the comparison stays valid.
     """
     device = device or get_device()
     if dtype is None:
@@ -124,7 +129,12 @@ def load_model(device: str | None = None, dtype: torch.dtype | None = None) -> H
         dtype = getattr(torch, env_dtype) if env_dtype else _default_dtype(device)
 
     if device not in _MODEL_CACHE:
-        model = HookedTransformer.from_pretrained(MODEL_NAME, device=device, dtype=dtype)
+        if dtype == torch.float32:
+            model = HookedTransformer.from_pretrained(MODEL_NAME, device=device, dtype=dtype)
+        else:
+            model = HookedTransformer.from_pretrained_no_processing(
+                MODEL_NAME, device=device, dtype=dtype
+            )
         model.eval()
         _MODEL_CACHE[device] = model
     return _MODEL_CACHE[device]
