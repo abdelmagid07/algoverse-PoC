@@ -18,11 +18,22 @@ import torch
 from transformer_lens import HookedTransformer
 
 # --- Shared constants ------------------------------------------------------
-MODEL_NAME = "gpt2"  # GPT-2-small, 124M, 12 layers, d_model=768. Non-gated.
+# Instruction-tuned model: a base model (e.g. GPT-2) falls into repetition
+# loops and prompt echoes and never produces real multi-hop reasoning steps,
+# which makes the fast-vs-slow comparison a test on noise. Llama-3.2-1B-Instruct
+# actually follows the "reason in steps, then answer" instruction. Gated:
+# requires accepting the license + an HF token (see README).
+MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 
-# Middle layer of GPT-2-small (layers 0..11). Middle layers tend to carry the
-# most task-relevant signal in prior mech-interp work.
-LAYER = 6
+# Middle layer of Llama-3.2-1B (16 layers, 0..15). Middle layers tend to carry
+# the most task-relevant signal in prior mech-interp work.
+LAYER = 8
+
+# Minimum VRAM to run on GPU. Attribution patching needs a backward pass, which
+# does not fit alongside a 1B model's activations in a small (4 GB) card, so we
+# fall back to CPU there. A Colab T4 (16 GB) clears this easily and is much
+# faster. Override explicitly with the VERITAS_DEVICE env var ("cuda"/"cpu").
+MIN_GPU_BYTES = 6 * 1024 ** 3
 
 # The trajectory text is followed by this cue; the answer-logit is read at the
 # final position (which predicts the first answer token). This is THE explicit
@@ -39,8 +50,21 @@ ACT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_device() -> str:
-    """GPU if available, else CPU. GPT-2-small fits comfortably either way."""
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    """Use GPU only if it has enough VRAM for a 1B forward+backward; else CPU.
+
+    On Colab (T4/A100) this selects CUDA and runs fast; on a 4 GB local card it
+    falls back to CPU to avoid OOM during the attribution-patching backward pass.
+    """
+    override = os.environ.get("VERITAS_DEVICE")
+    if override:
+        return override
+    if torch.cuda.is_available():
+        try:
+            if torch.cuda.get_device_properties(0).total_memory >= MIN_GPU_BYTES:
+                return "cuda"
+        except Exception:
+            pass
+    return "cpu"
 
 
 _MODEL_CACHE: dict[str, HookedTransformer] = {}

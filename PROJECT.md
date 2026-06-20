@@ -334,7 +334,7 @@ All of the above belong in the full 9-week team project if this PoC gives a gree
 
 ---
 
-## Interview / Meeting Talking Points
+# Meeting Talking Points
 
 Be ready to explain:
 - **Why attribution patching instead of full activation patching for the main study?** — Linear-cost approximation makes it tractable across hundreds of trajectories; full patching is the ground-truth check, not the production method

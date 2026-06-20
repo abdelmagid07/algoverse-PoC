@@ -1,10 +1,16 @@
-"""Phase 1: minimal multi-hop QA agent loop over GPT-2-small.
+"""Phase 1: minimal multi-hop QA agent loop over Llama-3.2-1B-Instruct.
 
-No LangGraph, no framework: a plain Python loop. At each step the model
-generates one short reasoning line; we record the exact token position that
-"commits" the step (its last generated token) so the patching methods can
-later score that position. After the loop we append the answer cue and read
-off the model's final answer.
+No LangGraph, no framework: a plain Python loop. We prompt the instruction-tuned
+model (via its chat template) to reason in short numbered steps and then give a
+final answer, generate the whole chain in a single KV-cached pass with a
+repetition penalty, then parse the response into discrete reasoning steps and
+record the exact token position that "commits" each step (the newline ending
+its line). The answer cue position is the shared metric position for patching.
+
+An earlier version used GPT-2-small (base, not instruction-tuned); it collapsed
+into repetition loops and prompt echoes, so the trajectories had no genuine
+multi-hop steps and the fast-vs-slow comparison was a test on noise. An
+instruction-tuned model is required for the trajectories to be meaningful.
 
 Run as a script to collect the trajectories:
     python -m agent.runner
@@ -29,10 +35,11 @@ from agent.trace_logger import log_trajectory
 SAMPLE_PATH = DATA_DIR / "hotpotqa_sample.json"
 TRAJ_PATH = RESULTS_DIR / "trajectories.json"
 
-MAX_STEPS = 6
-MAX_TOKENS_PER_STEP = 24
-MAX_ANSWER_TOKENS = 12
+MAX_STEPS = 6              # cap on parsed reasoning steps per trajectory
+MAX_NEW_TOKENS = 200       # budget for the whole reasoning chain
+MAX_ANSWER_TOKENS = 16
 N_TRAJECTORIES = 10
+FREQ_PENALTY = 1.0         # discourage the repetition loops a small model falls into
 
 
 # --------------------------------------------------------------------------
@@ -98,18 +105,63 @@ def is_success(generated: str, gold: str) -> bool:
 
 
 # --------------------------------------------------------------------------
-# Generation helpers (token-level so positions are exact)
+# Generation (instruct chat template + single KV-cached pass)
 # --------------------------------------------------------------------------
-def _greedy_until(model, tokens: torch.Tensor, stop_token_id: int, max_new: int) -> torch.Tensor:
-    """Greedy-decode appending to `tokens`; stop at stop_token_id or max_new."""
-    for _ in range(max_new):
-        with torch.no_grad():
-            logits = model(tokens)
-        next_tok = logits[0, -1].argmax().view(1, 1)
-        tokens = torch.cat([tokens, next_tok], dim=1)
-        if next_tok.item() == stop_token_id:
-            break
-    return tokens
+def build_prompt_tokens(model, question: str, facts: str) -> torch.Tensor:
+    """Build the chat-formatted prompt for the instruction-tuned model."""
+    system = (
+        "You are a careful multi-hop question answering assistant. "
+        "Using only the facts provided, reason in short numbered steps "
+        "(one concise step per line), then end with a line 'Answer: <answer>'."
+    )
+    user = f"Facts: {facts}\n\nQuestion: {question}"
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    prompt_str = model.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    return model.to_tokens(prompt_str, prepend_bos=False)
+
+
+def _generate(model, tokens: torch.Tensor, max_new: int) -> torch.Tensor:
+    """Greedy generation with a repetition penalty, using the KV cache."""
+    return model.generate(
+        tokens,
+        max_new_tokens=max_new,
+        do_sample=False,
+        freq_penalty=FREQ_PENALTY,
+        use_past_kv_cache=True,
+        stop_at_eos=True,
+        verbose=False,
+        return_type="tokens",
+    )
+
+
+def _split_lines(model, full_tokens: torch.Tensor, start: int) -> list[tuple[str, int]]:
+    """Split generated tokens [start:] into (line_text, commit_position) pairs,
+    where commit_position is the index of the newline that ends each line."""
+    lines: list[tuple[str, int]] = []
+    cur_start = start
+    n = full_tokens.shape[1]
+    for pos in range(start, n):
+        piece = model.to_string(full_tokens[0, pos : pos + 1])
+        if "\n" in piece:
+            text = model.to_string(full_tokens[0, cur_start : pos + 1]).strip()
+            if text:
+                lines.append((text, pos))
+            cur_start = pos + 1
+    if cur_start < n:  # trailing line without a newline
+        text = model.to_string(full_tokens[0, cur_start:n]).strip()
+        if text:
+            lines.append((text, n - 1))
+    return lines
+
+
+def _is_answer_line(text: str) -> bool:
+    head = text.lower().lstrip("0123456789.):- ").strip()
+    return head.startswith("answer")
 
 
 def run_trajectory(model, example: dict) -> dict:
@@ -118,43 +170,45 @@ def run_trajectory(model, example: dict) -> dict:
     gold = example["answer"]
     facts = supporting_facts_text(example)
 
-    newline_id = model.to_single_token("\n")
+    prompt_tokens = build_prompt_tokens(model, question, facts)
+    prompt_len = prompt_tokens.shape[1]
 
-    prompt = (
-        "Answer the question using the facts. Reason in numbered steps.\n\n"
-        f"Facts: {facts}\n\n"
-        f"Question: {question}\n"
-    )
-    tokens = model.to_tokens(prompt)  # includes BOS
+    full = _generate(model, prompt_tokens, MAX_NEW_TOKENS)
+    lines = _split_lines(model, full, prompt_len)
 
-    step_positions: list[int] = []
-    step_texts: list[str] = []
-    prev_len = tokens.shape[1]
-
-    for step_idx in range(MAX_STEPS):
-        step_prefix = model.to_tokens(f"\nStep {step_idx + 1}:", prepend_bos=False)
-        tokens = torch.cat([tokens, step_prefix], dim=1)
-        prev_len = tokens.shape[1]
-
-        tokens = _greedy_until(model, tokens, newline_id, MAX_TOKENS_PER_STEP)
-
-        commit_pos = tokens.shape[1] - 1  # last token of this step "commits" it
-        step_positions.append(commit_pos)
-        step_text = model.to_string(tokens[0, prev_len:]).strip()
-        step_texts.append(step_text)
-
-        if "answer" in step_text.lower():
+    # Reasoning steps = lines before the model's own "Answer:" line.
+    steps: list[tuple[str, int]] = []
+    for text, pos in lines:
+        if _is_answer_line(text):
             break
+        steps.append((text, pos))
 
-    # Append the answer cue; the position predicting the first answer token is
-    # the shared metric position for both patching methods.
+    # Fallback: if the model didn't produce clean numbered lines, chunk the
+    # generated region into a few equal token spans so we still get distinct
+    # positions to score.
+    if len(steps) < 2:
+        gen_end = lines[-1][1] if lines else full.shape[1] - 1
+        span = max(1, (gen_end - prompt_len) // MAX_STEPS)
+        steps = [
+            (model.to_string(full[0, prompt_len + k * span : prompt_len + (k + 1) * span]).strip(),
+             min(prompt_len + (k + 1) * span - 1, gen_end))
+            for k in range(MAX_STEPS)
+        ]
+        steps = [(t, p) for t, p in steps if t]
+
+    steps = steps[:MAX_STEPS]
+    step_texts = [t for t, _ in steps]
+    step_positions = [p for _, p in steps]
+
+    # Build the metric sequence: reasoning up to the last step + answer cue.
+    last_step_pos = step_positions[-1]
     cue = model.to_tokens(ANSWER_CUE, prepend_bos=False)
-    tokens = torch.cat([tokens, cue], dim=1)
-    answer_position = tokens.shape[1] - 1
+    metric_tokens = torch.cat([full[:, : last_step_pos + 1], cue], dim=1)
+    answer_position = metric_tokens.shape[1] - 1
 
-    # Decode the model's answer (for the success label only).
-    ans_tokens = _greedy_until(model, tokens.clone(), newline_id, MAX_ANSWER_TOKENS)
-    generated_answer = model.to_string(ans_tokens[0, answer_position + 1:]).strip()
+    # Decode the model's answer at the cue (for the success label only).
+    ans_full = _generate(model, metric_tokens.clone(), MAX_ANSWER_TOKENS)
+    generated_answer = model.to_string(ans_full[0, answer_position + 1:]).strip().split("\n")[0]
 
     gold_first_token_id = model.to_tokens(" " + gold.strip(), prepend_bos=False)[0, 0].item()
 
@@ -163,7 +217,7 @@ def run_trajectory(model, example: dict) -> dict:
         "question": question,
         "gold_answer": gold,
         "facts": facts,
-        "token_ids": tokens[0, : answer_position + 1].tolist(),
+        "token_ids": metric_tokens[0, : answer_position + 1].tolist(),
         "answer_position": answer_position,
         "gold_first_token_id": int(gold_first_token_id),
         "step_positions": step_positions,
