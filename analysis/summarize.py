@@ -1,10 +1,17 @@
-"""Phase 4: auto-generate results/poc_summary.md from the computed results.
+"""Phase 4: auto-generate results/poc_summary.md from the probe results.
 
-This keeps the summary reproducible (e.g. on Colab) instead of hand-written.
-Critically, it runs a degeneracy check on the trajectories: if the agent never
-produced genuine multi-hop reasoning (repetitive steps, 0 success), the
-correlation is a test on noise, so the summary reports INCONCLUSIVE rather than
-mapping r straight onto a go/no-go band.
+Reproducible (so it regenerates identically on Colab) and honest: it reports the
+class balance, the majority-class chance baseline, the cross-validation spread
+(not just means), how many layers show the early->late increase, and the
+high-dimensional / low-N regularization caveat.
+
+Decision rule (from NEW_PROPOSAL_POC_GUIDE.md), applied to relative-position bins:
+  * STRONG     - accuracy clearly above chance AND clearly increasing early->late
+                 on a meaningful number of layers -> green light.
+  * CAUTIOUS   - above chance somewhere but roughly flat across position ->
+                 pursue, but reframe from "early forecasting" to "internal state
+                 correlates with outcome."
+  * NO SIGNAL  - near chance everywhere -> do not pursue; fall back to Idea 4.
 
 Run:  python -m analysis.summarize
 """
@@ -12,133 +19,215 @@ from __future__ import annotations
 
 import json
 
-from interp.activation_cache import ANSWER_CUE, LAYER, MODEL_NAME, RESULTS_DIR
+import numpy as np
 
-TRAJ_PATH = RESULTS_DIR / "trajectories.json"
-FAST_PATH = RESULTS_DIR / "fast_scores.json"
-SLOW_PATH = RESULTS_DIR / "slow_scores.json"
-CORR_PATH = RESULTS_DIR / "correlation.json"
+from interp.activation_cache import MODEL_NAME, RESULTS_DIR
+
+PROBE_PATH = RESULTS_DIR / "probe_results.json"
 OUT_PATH = RESULTS_DIR / "poc_summary.md"
 
+# Margins, deliberately conservative given the small-N noise.
+CHANCE_MARGIN = 0.10   # accuracy must beat chance by this to count as "signal"
+INCREASE_MARGIN = 0.10  # late-minus-early delta to count as "increasing"
 
-def _repetition_rate(step_texts: list[str]) -> float:
-    """Fraction of steps that duplicate an earlier step in the same trajectory."""
-    if len(step_texts) <= 1:
-        return 0.0
-    seen, dupes = set(), 0
-    for t in step_texts:
-        key = t.strip().lower()
-        if key in seen:
-            dupes += 1
-        seen.add(key)
-    return dupes / len(step_texts)
+
+def _bin_layer_arrays(payload: dict):
+    """Return dict bin_idx -> np.array of per-layer acc_mean (NaN where missing)."""
+    n_layers = payload["n_layers"]
+    n_bins = len(payload["bins"])
+    grid = np.full((n_layers, n_bins), np.nan)
+    std = np.full((n_layers, n_bins), np.nan)
+    auc = np.full((n_layers, n_bins), np.nan)
+    for r in payload["results"]:
+        if r["acc_mean"] is not None:
+            grid[r["layer"], r["bin_idx"]] = r["acc_mean"]
+            std[r["layer"], r["bin_idx"]] = r["acc_std"]
+        if r["auc"] is not None:
+            auc[r["layer"], r["bin_idx"]] = r["auc"]
+    return grid, std, auc
+
+
+def classify(payload: dict) -> dict:
+    grid, std, auc = _bin_layer_arrays(payload)
+    bins = payload["bins"]
+    chance = payload["overall_chance"]
+    n_layers = payload["n_layers"]
+
+    per_bin_mean = np.nanmean(grid, axis=0)   # mean over layers
+    per_bin_spread = np.nanstd(grid, axis=0)  # spread over layers
+    per_bin_auc = np.nanmean(auc, axis=0)
+
+    early_i, late_i = 0, len(bins) - 1
+    early_mean = per_bin_mean[early_i]
+    late_mean = per_bin_mean[late_i]
+    delta = late_mean - early_mean
+
+    # Per-layer early->late increase that also clears chance at the late bin.
+    layer_delta = grid[:, late_i] - grid[:, early_i]
+    increasing_layers = int(np.nansum(
+        (layer_delta > INCREASE_MARGIN) & (grid[:, late_i] > chance + CHANCE_MARGIN)
+    ))
+
+    above_chance_anywhere = np.nanmax(per_bin_mean) > chance + CHANCE_MARGIN
+    increasing = (delta > INCREASE_MARGIN) and (late_mean > chance + CHANCE_MARGIN) \
+        and (increasing_layers >= max(1, round(0.25 * n_layers)))
+
+    if not above_chance_anywhere:
+        band = "no_signal"
+        action = (
+            "Accuracy stays near chance at every relative position and layer. No "
+            "usable signal at this scale - do not pursue as the primary direction; "
+            "fall back to Idea 4 (goal drift)."
+        )
+    elif increasing:
+        band = "strong"
+        action = (
+            "Outcome decodability is clearly above chance and increases from the "
+            "early to the late portion of trajectories on multiple layers. Strong "
+            "signal at small scale - green light to pursue as the primary direction."
+        )
+    else:
+        band = "cautious"
+        action = (
+            "Outcome decodability is above chance but does not clearly increase "
+            "toward the end of trajectories. Some signal exists, but the "
+            "'forecasting before the outcome is visible' story is weaker than hoped "
+            "- pursue with caution and reframe around 'internal state correlates "
+            "with outcome' rather than 'early forecasting.'"
+        )
+
+    return {
+        "band": band,
+        "action": action,
+        "chance": chance,
+        "per_bin_mean": per_bin_mean,
+        "per_bin_spread": per_bin_spread,
+        "per_bin_auc": per_bin_auc,
+        "delta": delta,
+        "increasing_layers": increasing_layers,
+        "grid": grid,
+        "std": std,
+    }
 
 
 def main() -> None:
-    trajectories = json.loads(TRAJ_PATH.read_text(encoding="utf-8"))
-    fast = json.loads(FAST_PATH.read_text(encoding="utf-8"))
-    slow = json.loads(SLOW_PATH.read_text(encoding="utf-8"))
-    corr = json.loads(CORR_PATH.read_text(encoding="utf-8"))
+    payload = json.loads(PROBE_PATH.read_text(encoding="utf-8"))
+    bins = payload["bins"]
+    n = payload["n_trajectories"]
+    n_success = payload["n_success"]
+    n_fail = payload["n_fail"]
+    chance = payload["overall_chance"]
 
-    n = len(trajectories)
-    n_success = sum(t["success"] for t in trajectories)
-    single_step = sum(1 for t in trajectories if len(t["step_positions"]) == 1)
-    rep_rates = [_repetition_rate(t["step_texts"]) for t in trajectories]
-    avg_rep = sum(rep_rates) / n if n else 0.0
+    c = classify(payload)
+    grid, std = c["grid"], c["std"]
 
-    # Degeneracy: lots of repeated steps or nothing solved -> trajectories are
-    # not real multi-hop reasoning, so the correlation does not test the method.
-    degenerate = (n_success == 0 and avg_rep > 0.3) or single_step > n / 2
-
-    r = corr["pearson_r"]
-
-    # Top |fast| step per trajectory for the qualitative read.
-    top_lines = []
-    for t in trajectories:
-        scores = fast[t["id"]]
-        i = max(range(len(scores)), key=lambda k: abs(scores[k]))
-        txt = t["step_texts"][i].replace("\n", " ")[:80]
-        top_lines.append(
-            f"- `{t['id'][:8]}` (gold: {t['gold_answer']!r}, success={t['success']}): "
-            f"top step {i + 1}/{len(scores)} fast={scores[i]:+.3f} "
-            f"slow={slow[t['id']][i]:+.3f} -- {txt!r}"
-        )
-
-    if degenerate:
-        verdict = "INCONCLUSIVE (degenerate trajectories)"
-        recommendation = (
-            "The agent did not produce genuine multi-hop reasoning "
-            f"(success {n_success}/{n}, avg within-trajectory step-repetition "
-            f"{avg_rep:.0%}, {single_step}/{n} single-step). The fast-vs-slow "
-            "correlation was therefore measured on near-degenerate text, so it "
-            "neither validates nor refutes the method. **Do not treat r as a "
-            "go/no-go.** Re-run with a model/loop that yields distinguishable "
-            "reasoning steps before drawing a conclusion."
-        )
+    # Best layer at the late bin (for an honest "spread, not just mean" callout).
+    late_i = len(bins) - 1
+    late_col = grid[:, late_i]
+    if np.isfinite(late_col).any():
+        best_layer = int(np.nanargmax(late_col))
+        best_late = late_col[best_layer]
+        best_late_std = std[best_layer, late_i]
+        best_str = (f"layer {best_layer}: {best_late:.3f} +/- {best_late_std:.3f} "
+                    f"(fold spread)")
     else:
-        verdict = corr["band"].upper()
-        recommendation = corr["action"]
+        best_str = "n/a (late bin not probeable)"
 
-    md = f"""# Veritas PoC - Results Summary
+    # Per-bin table rows.
+    bin_rows = []
+    for j, name in enumerate(bins):
+        m = c["per_bin_mean"][j]
+        sp = c["per_bin_spread"][j]
+        au = c["per_bin_auc"][j]
+        cells = [r for r in payload["results"] if r["bin_idx"] == j]
+        ns = [r["n"] for r in cells]
+        nrow = ns[0] if ns else 0
+        npos = cells[0]["n_pos"] if cells else 0
+        nneg = cells[0]["n_neg"] if cells else 0
+        m_str = "n/a" if np.isnan(m) else f"{m:.3f}"
+        sp_str = "n/a" if np.isnan(sp) else f"{sp:.3f}"
+        au_str = "n/a" if np.isnan(au) else f"{au:.3f}"
+        bin_rows.append(
+            f"| {name} | {m_str} | {sp_str} | {au_str} | {nrow} ({npos}+/{nneg}-) |"
+        )
 
-_Auto-generated by `analysis/summarize.py` from the computed results._
+    band_label = {"strong": "STRONG", "cautious": "CAUTIOUS", "no_signal": "NO SIGNAL"}[c["band"]]
+    imbalance_note = ""
+    if min(n_success, n_fail) < 0.3 * n:
+        imbalance_note = (
+            f" Class balance is skewed ({n_success} success / {n_fail} fail), so "
+            "accuracy is read against the majority-class chance baseline above, and "
+            "AUC is the more trustworthy metric here."
+        )
 
-## The number (go/no-go metric)
+    md = f"""# Latent Failure Forecasting PoC - Results Summary
+
+_Auto-generated by `analysis/summarize.py` from `results/probe_results.json`._
+
+## Verdict
 
 | Metric | Value |
 |---|---|
 | Model | `{MODEL_NAME}` |
-| Pearson r (fast vs. slow) | **{r:.3f}** |
-| p-value | {corr['p_value']:.4f} |
-| Steps compared | {corr['n_steps']} (across {n} trajectories) |
-| Layer patched | {LAYER} |
-| Verdict | **{verdict}** |
+| Trajectories | {n} (success={n_success}, fail={n_fail}) |
+| Chance baseline (majority class) | {chance:.3f} |
+| Layers probed | {payload['n_layers']} (d_model={payload['d_model']}) |
+| Early->late delta (mean over layers) | {c['delta']:+.3f} |
+| Layers showing the increase | {c['increasing_layers']}/{payload['n_layers']} |
+| Best late-bin probe | {best_str} |
+| **Decision band** | **{band_label}** |
 
-## Trajectory health check
+## Accuracy by relative position (mean over layers)
 
-- Success: {n_success}/{n}
-- Single-step trajectories: {single_step}/{n}
-- Avg within-trajectory step repetition: {avg_rep:.0%}
-- Degenerate (correlation untrustworthy): **{degenerate}**
+| Relative position | Acc (mean over layers) | Spread across layers | AUC (OOF) | n (pos/neg) |
+|---|---|---|---|---|
+{chr(10).join(bin_rows)}
 
-## The answer-token decision (flagged explicitly, per PROPOSAL.md)
+Chance baseline = {chance:.3f}. "Spread across layers" is the std of the per-layer
+accuracies; the per-cell cross-validation fold spread is in `probe_results.json`
+(`acc_std`). See `accuracy_by_position.png`, `accuracy_by_layer.png`, and
+`probe_heatmap.png`.
 
-The single scalar both methods perturb is the **logit of the first token of the
-gold answer**, read at the final position of one forward pass over
-`<trajectory text> + "{ANSWER_CUE.strip()}"`. Both attribution patching (fast)
-and activation patching (slow) measure their effect on this exact number.
+## Class balance
 
-## Top-scored step per trajectory (qualitative read)
-
-{chr(10).join(top_lines)}
-
-## Standing methodological caveats
-
-1. **Zero-ablation counterfactual.** Attribution patching is a first-order
-   (linear) approximation; zeroing a whole residual is a large, off-distribution
-   perturbation, the regime where the linear approximation is weakest. Some
-   fast/slow disagreement is expected from this choice alone.
-2. **Single layer, single counterfactual, 5-10 trajectories** - this is a
-   direction-validation PoC, not a publication-grade measurement.
+{n_success} successes / {n_fail} failures out of {n} trajectories.{imbalance_note}
 
 ## Recommendation
 
-{recommendation}
+{c['action']}
+
+## Methodological caveats (read before trusting the numbers)
+
+1. **Small N / cross-validation noise.** With ~{n} trajectories, CV folds hold
+   only a handful of examples each, so accuracy is noisy. We report the spread
+   across folds (`acc_std`) and across layers, not just the mean - do not over-read
+   any single accuracy number.
+2. **High dimensions vs. few samples.** The residual stream is {payload['d_model']}-dim
+   but N ~ {n}, so the probe is heavily regularized (StandardScaler + L2,
+   C={payload['probe_C']}). Absolute accuracy is regularization-sensitive; the
+   *shape* of the early->late trend matters more than the absolute level.
+3. **Relative-position binning.** Steps are bucketed into early/mid/late thirds of
+   each trajectory (not absolute step index) so that short and long trajectories
+   both contribute to every bin, removing the "fewer examples at late steps"
+   confound. Each trajectory contributes one mean-pooled row per bin.
+4. **PoC scope.** No causal validation, no SAE features, single domain (HotpotQA),
+   logistic-regression probes only. This is a direction-validation PoC, not a
+   publication-grade measurement.
 
 ## Reproduce
 
 ```bash
-python -m agent.runner
-python -m interp.attribution_patch
-python -m interp.ground_truth_patch
-python -m analysis.correlate
-python -m analysis.visualize
+python -m agent.runner          # collect 20 trajectories + cache activations
+python -m analysis.probe        # layer x relative-position probes (CV)
+python -m analysis.visualize_probe
 python -m analysis.summarize
 ```
 """
     OUT_PATH.write_text(md, encoding="utf-8")
-    print(f"Wrote {OUT_PATH}")
-    print(f"Verdict: {verdict}  (degenerate={degenerate}, r={r:.3f})")
+    print(f"Wrote {OUT_PATH}", flush=True)
+    print(f"Decision band: {band_label}  "
+          f"(delta={c['delta']:+.3f}, increasing_layers={c['increasing_layers']})",
+          flush=True)
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ TRAJ_PATH = RESULTS_DIR / "trajectories.json"
 MAX_STEPS = 6              # cap on parsed reasoning steps per trajectory
 MAX_NEW_TOKENS = 200       # budget for the whole reasoning chain
 MAX_ANSWER_TOKENS = 16
-N_TRAJECTORIES = 10
+N_TRAJECTORIES = 20        # probe training needs a few examples per class
 FREQ_PENALTY = 1.0         # discourage the repetition loops a small model falls into
 
 
