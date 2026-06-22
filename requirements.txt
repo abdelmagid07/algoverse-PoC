@@ -1,8 +1,9 @@
 # Colab dependency strategy (read before editing):
 #
-# Do NOT list `torch` here. Colab pre-installs a CUDA build (usually 2.7+).
-# Putting bare `torch` in requirements makes pip reinstall/downgrade it, which
-# breaks transformers 5.x (needs torch.compiler.disable(reason=), added in 2.7).
+# Do NOT list `torch` here — Colab pre-installs a CUDA build. The notebook install
+# cell pins torch via a pip constraints file and force-reinstalls it after pip,
+# because installing TL/transformers can mix torch subpackages (compiler vs
+# _dynamo) and crash transformers import with disable(reason=).
 #
 # Do NOT unpin transformer_lens / transformers together blindly. TL >= 3.4 is
 # required for n_ctx=8192; transformers >= 5.4 is required by TL 3.4. Those two
