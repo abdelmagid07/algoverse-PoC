@@ -3,17 +3,17 @@
 # kwarg to HuggingFace and crash. TL 3.4 in turn pins torch>=2.6 (Colab ships
 # 2.7) and transformers>=5.4. With torch 2.7, torch.compiler.disable(reason=...)
 # works, so the earlier transformers upper bound is no longer needed.
-transformer_lens>=3.4.0
-torch>=2.6
-transformers>=5.4.0
+transformer_lens
+torch
+transformers
 # NOTE: TL 3.4 pulls torchvision in transitively, but only imports it inside a
 # try/except for vision processors we never use. On Colab a pip-installed
 # torchvision often mismatches the cu126 torch build, and then transformers'
 # lazy vision import crashes with "operator torchvision::nms does not exist".
 # The Colab notebook therefore UNINSTALLS torchvision after install (TL tolerates
 # its absence, transformers skips vision). So it is intentionally NOT pinned here.
-datasets>=2.18.0
-scipy>=1.11.0
-scikit-learn>=1.3.0
-matplotlib>=3.7.0
-numpy>=1.24.0
+datasets
+scipy
+scikit-learn
+matplotlib
+numpy
