@@ -26,10 +26,11 @@ unchanged; only the trajectory source changed.
 - **Compute:** GPU for the trajectory replay (Colab T4 recommended; loads in fp16
   via `from_pretrained_no_processing` to avoid Colab RAM crashes). The probe
   analysis itself is sklearn on CPU.
-- **T4 memory budget:** attention is O(tokens^2), so each replay is capped at
-  `MAX_CONTEXT_TOKENS` (8192) with each observation head-truncated to
-  `OBS_TOKEN_CAP` (256) tokens; only step-boundary activations are stored
-  (`[n_steps, d_model]` per layer), keeping disk/RAM O(n_steps).
+- **Context budget:** each replay must fit `model.cfg.n_ctx` (2048 in
+  TransformerLens for Llama-3.2-1B — rotary embeddings are not computed beyond
+  that). Observations and `ai` turns are per-turn capped; oldest (user, ai)
+  pairs may be dropped if still over budget. Only step-boundary activations are
+  stored (`[n_steps, d_model]` per layer), keeping disk/RAM O(n_steps).
 
 ### Gated-model access (one-time)
 
