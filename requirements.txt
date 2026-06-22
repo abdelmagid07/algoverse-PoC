@@ -1,17 +1,18 @@
-# transformer_lens >= 3.4 is required for the n_ctx override in from_pretrained
-# (HookedTransformer.from_pretrained(..., n_ctx=8192)); older versions leak the
-# kwarg to HuggingFace and crash. TL 3.4 in turn pins torch>=2.6 (Colab ships
-# 2.7) and transformers>=5.4. With torch 2.7, torch.compiler.disable(reason=...)
-# works, so the earlier transformers upper bound is no longer needed.
-transformer_lens
-torch
-transformers
-# NOTE: TL 3.4 pulls torchvision in transitively, but only imports it inside a
-# try/except for vision processors we never use. On Colab a pip-installed
-# torchvision often mismatches the cu126 torch build, and then transformers'
-# lazy vision import crashes with "operator torchvision::nms does not exist".
-# The Colab notebook therefore UNINSTALLS torchvision after install (TL tolerates
-# its absence, transformers skips vision). So it is intentionally NOT pinned here.
+# Colab dependency strategy (read before editing):
+#
+# Do NOT list `torch` here. Colab pre-installs a CUDA build (usually 2.7+).
+# Putting bare `torch` in requirements makes pip reinstall/downgrade it, which
+# breaks transformers 5.x (needs torch.compiler.disable(reason=), added in 2.7).
+#
+# Do NOT unpin transformer_lens / transformers together blindly. TL >= 3.4 is
+# required for n_ctx=8192; transformers >= 5.4 is required by TL 3.4. Those two
+# must match each other AND Colab's torch — pin them, leave torch alone.
+#
+# sklearn / matplotlib / numpy / scipy / datasets are safe to leave loose.
+
+transformer_lens>=3.4.0
+transformers>=5.4.0
+
 datasets
 scipy
 scikit-learn
