@@ -1,7 +1,7 @@
-# Latent Failure Forecasting PoC
+# Latent Failure Forecasting PoC (SWE-bench Lite)
 
 A 1-2 day solo validation experiment. **One question:** can a simple linear probe
-on a model's residual stream predict whether a multi-hop QA trajectory will
+on a model's residual stream predict whether a long-horizon agent trajectory will
 ultimately succeed or fail — and does that decodability **increase as the agent
 nears its own conclusion**?
 
@@ -10,18 +10,26 @@ nears its own conclusion**?
   with outcome" rather than "early forecasting."
 - If it is near chance everywhere: pivot.
 
-This is a pivot from the earlier Veritas PoC (fast-vs-slow causal scoring); the
-agent loop and activation caching are reused, only the analysis is new.
+**Data source:** pre-generated SWE-bench agent trajectories from
+[`nebius/swe-agent-trajectories`](https://huggingface.co/datasets/nebius/swe-agent-trajectories).
+We do **not** run a live agent — we replay each existing run's text through
+Llama-3.2-1B and read its internal state at step boundaries. This is a migration
+from an earlier HotpotQA version, whose ~3-step trajectories were too short to
+test the early->late forecasting hypothesis (see the comparison table in
+`results/poc_summary.md`). The probe / visualize / summarize methodology is
+unchanged; only the trajectory source changed.
 
 ## Model & compute
 
 - **Model:** Llama-3.2-1B-Instruct via TransformerLens
   (`HookedTransformer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")`).
-  An instruction-tuned model is required so trajectories contain genuine
-  multi-step reasoning (a base model collapses into repetition).
-- **Compute:** GPU for trajectory collection (Colab T4 recommended; loads in fp16
+- **Compute:** GPU for the trajectory replay (Colab T4 recommended; loads in fp16
   via `from_pretrained_no_processing` to avoid Colab RAM crashes). The probe
   analysis itself is sklearn on CPU.
+- **T4 memory budget:** attention is O(tokens^2), so each replay is capped at
+  `MAX_CONTEXT_TOKENS` (8192) with each observation head-truncated to
+  `OBS_TOKEN_CAP` (256) tokens; only step-boundary activations are stored
+  (`[n_steps, d_model]` per layer), keeping disk/RAM O(n_steps).
 
 ### Gated-model access (one-time)
 
@@ -30,6 +38,9 @@ agent loop and activation caching are reused, only the analysis is new.
 
 ## Method (flagged design choices)
 
+- **Step boundary = one `ai` (assistant) turn.** Its step position is that turn's
+  final token; `user`/`system` turns are observations (tool output, the issue
+  text), not steps. Success label = the dataset's `target` field.
 - **Step axis = relative position.** Each trajectory's steps are split into
   early/mid/late thirds (`step_idx / total_steps`), so short and long trajectories
   both contribute to every bin. Measures "signal grows toward the agent's own
@@ -56,7 +67,7 @@ each trajectory so interrupts are recoverable — just re-run the cell to resume
 ```bash
 pip install -r requirements.txt
 
-python -m agent.runner            # collect ~20 trajectories + cache activations
+python -m agent.swebench_loader   # collect ~18 SWE-bench trajectories + cache step-boundary activations
 python -m analysis.probe          # logistic-regression probes (layer x position)
 python -m analysis.visualize_probe # heatmap + accuracy-by-position + accuracy-by-layer
 python -m analysis.summarize       # writes results/poc_summary.md
@@ -68,16 +79,18 @@ Or run all of it in one process with `python run_pipeline.py`. Then read
 ## Layout
 
 ```
-agent/    minimal multi-hop QA loop + trajectory/activation logging (reused)
+agent/    swebench_loader.py: load + replay SWE-bench trajectories, cache step-boundary acts (new)
+          runner.py / trace_logger.py: HotpotQA loop (legacy, unwired)
 interp/   model loading + residual-stream activation caching (reused)
-analysis/ probe.py, visualize_probe.py, summarize.py (new)
+analysis/ probe.py, visualize_probe.py, summarize.py
           (correlate.py / interp patching modules are Veritas legacy, unused)
-data/     HotpotQA sample + cached activations
+data/     cached activations (compact [n_steps, d_model] .pt per trajectory)
 results/  probe results, plots, and the PoC summary
 ```
 
 ## Scope guardrails (deliberately out of scope for this PoC)
 
-No causal validation / activation patching / feature injection, no SAE features,
-no second dataset / SWE-bench, no large dataset (~20 trajectories only), nothing
-beyond sklearn logistic-regression probes.
+No live agent (we replay pre-generated SWE-bench Lite trajectories only), no
+causal validation / activation patching / feature injection, no SAE features, no
+large dataset (~15-20 trajectories only), nothing beyond sklearn
+logistic-regression probes.

@@ -6,8 +6,14 @@ per phase looked like a hang. This script loads the model once, saves
 trajectories incrementally (so a crash mid-run does not lose everything), then
 runs the probe analysis (which needs no GPU).
 
-Pipeline: collect trajectories + cache activations -> probe (logistic
-regression by layer x relative-position bin) -> visualize -> summarize.
+Pipeline: collect SWE-bench trajectories + cache step-boundary activations ->
+probe (logistic regression by layer x relative-position bin) -> visualize ->
+summarize.
+
+Trajectory source: pre-generated SWE-bench agent runs replayed through
+Llama-3.2-1B (agent/swebench_loader.py). The HotpotQA loop (agent/runner.py) is
+kept as legacy but is no longer wired in — its trajectories were too short
+(~3 steps) to test the early->late forecasting hypothesis.
 
 Usage (Colab or local):
     python run_pipeline.py
@@ -23,8 +29,11 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agent.runner import TRAJ_PATH, ensure_dataset, run_trajectory  # noqa: E402
-from agent.trace_logger import log_trajectory  # noqa: E402
+from agent.swebench_loader import (  # noqa: E402
+    TRAJ_PATH,
+    load_swebench_trajectories,
+    replay_and_cache_activations,
+)
 from analysis.probe import main as probe_main  # noqa: E402
 from analysis.summarize import main as summarize_main  # noqa: E402
 from analysis.visualize_probe import main as visualize_main  # noqa: E402
@@ -36,11 +45,12 @@ def _log(msg: str) -> None:
 
 
 def phase1_collect(model) -> list[dict]:
-    _log("\n=== Phase 1: collect trajectories ===")
-    examples = ensure_dataset()
-    _log(f"HotpotQA examples: {len(examples)}")
+    _log("\n=== Phase 1: collect SWE-bench trajectories (replay + cache) ===")
+    raw = load_swebench_trajectories()
+    _log(f"Candidate trajectories: {len(raw)}")
 
-    # Resume if a previous run was interrupted partway through.
+    # Resume if a previous run was interrupted partway through: a trajectory is
+    # "done" only if its compact activation .pt actually exists on disk.
     done: dict[str, dict] = {}
     if TRAJ_PATH.exists():
         try:
@@ -51,25 +61,26 @@ def phase1_collect(model) -> list[dict]:
             _log("Warning: corrupt trajectories.json — starting fresh.")
 
     trajectories: list[dict] = []
-    for i, ex in enumerate(examples):
-        tid = str(ex.get("id", ""))
+    for i, rec in enumerate(raw):
+        tid = rec["id"]
         if tid in done and "activation_path" in done[tid] \
                 and Path(done[tid]["activation_path"]).exists():
             trajectories.append(done[tid])
-            _log(f"  [{i+1}/{len(examples)}] skip (already saved) id={tid[:8]}")
+            _log(f"  [{i+1}/{len(raw)}] skip (already saved) id={tid[:24]}")
             continue
 
-        _log(f"  [{i+1}/{len(examples)}] generating id={tid[:8]} ...")
-        traj = run_trajectory(model, ex)
-        _log(f"  [{i+1}/{len(examples)}] caching activations ...")
-        log_trajectory(model, traj)
+        _log(f"  [{i+1}/{len(raw)}] replay id={tid[:24]} "
+             f"(n_steps={rec['n_steps']}, success={rec['success']}) ...")
+        traj = replay_and_cache_activations(model, rec)
+        if traj is None:  # dropped: over the token budget after truncation
+            continue
         trajectories.append(traj)
 
         # Checkpoint after every trajectory so Colab interrupts are recoverable.
         TRAJ_PATH.write_text(json.dumps(trajectories, indent=2), encoding="utf-8")
         _log(
-            f"  [{i+1}/{len(examples)}] saved checkpoint | steps={len(traj['step_positions'])} "
-            f"success={traj['success']} answer={traj['generated_answer']!r}"
+            f"  [{i+1}/{len(raw)}] saved checkpoint | steps={traj['n_steps']} "
+            f"seq_len={traj['seq_len']} success={traj['success']}"
         )
 
     n_success = sum(t["success"] for t in trajectories)
