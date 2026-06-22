@@ -10,6 +10,9 @@
 # must match each other AND Colab's torch — pin them, leave torch alone.
 #
 # sklearn / matplotlib / numpy / scipy / datasets are safe to leave loose.
+# On Colab, the notebook install cell uses `pip install --no-deps transformer_lens`
+# so pip never replaces Colab's CUDA torch; do not `pip install -r requirements.txt`
+# with a torch constraint on Colab.
 
 transformer_lens>=3.4.0
 transformers>=5.4.0
