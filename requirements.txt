@@ -1,6 +1,10 @@
 transformer_lens>=2.0.0
 torch>=2.1.0
-transformers>=4.40.0
+# Upper bound: transformers >= 4.50 calls torch.compiler.disable(reason=...),
+# but the `reason` kwarg only exists in torch >= 2.6. On Colab (older torch)
+# that raises "disable() got an unexpected keyword argument 'reason'". 4.45 is
+# the floor for Llama-3.2 support, so this range works without touching torch.
+transformers>=4.45.0,<4.50.0
 datasets>=2.18.0
 scipy>=1.11.0
 scikit-learn>=1.3.0
