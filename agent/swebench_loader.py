@@ -29,13 +29,12 @@ Conventions (flagged choices, reported in the summary):
     trajectories through our model and read its internal state while it reads the
     run. (Caveat #3 in the summary.)
 
-The binding constraint is T4 attention memory (O(tokens^2)). We keep the single
-forward pass under `model.cfg.n_ctx` (2048 in TransformerLens) by truncating each
-observation and capping each `ai` turn, dropping oldest (user, ai) pairs if still
-over budget, and we store
+The model is loaded with n_ctx raised to 8192 (interp/activation_cache.py;
+TransformerLens otherwise caps Llama-3.2 at 2048 and longer sequences crash in
+rotary position encoding). That fits whole 8-20 step trajectories, so we only
+head-truncate `user`/`system` observations to OBS_TOKEN_CAP — `ai` reasoning
+turns (what the probe reads) are kept intact and no steps are dropped. We store
 only the step-boundary rows so disk/CPU memory is O(n_steps), not O(seq_len).
-Replay must also fit `model.cfg.n_ctx` (2048 in TransformerLens); longer
-sequences crash in rotary position encoding even if T4 VRAM would allow them.
 
 Run as a script for a quick standalone collect:
     python -m agent.swebench_loader
@@ -59,14 +58,16 @@ TRAJ_PATH = RESULTS_DIR / "trajectories.json"
 MIN_STEPS = 8
 MAX_STEPS = 20
 
-# Observations are the memory hog (p90 ~1158 tok, max ~4000). Capping each keeps
-# replay under the model context window; ai turns are capped too when needed.
-OBS_TOKEN_CAP = 64
-AI_TOKEN_CAP = 128
-# Hard ceiling is model.cfg.n_ctx (2048 for Llama-3.2-1B in TransformerLens).
-# We previously used 8192 for T4 VRAM, but rotary embeddings are precomputed only
-# up to n_ctx — longer sequences crash in apply_rotary (4819 vs 2048).
-MAX_CONTEXT_TOKENS = 2048   # fallback when model is not passed to the encoder
+# Observations are the memory hog (p90 ~1158 tok, max ~4000). Capping each to 256
+# tokens keeps a median trajectory well under budget; ai turns are left whole so
+# the reasoning that the probe reads is never clipped.
+OBS_TOKEN_CAP = 256
+# Hard ceiling: the model is loaded with n_ctx=8192 (interp/activation_cache.py),
+# which fits whole SWE-bench trajectories in the 8-20 step band. A rare
+# trajectory still over this after observation truncation is dropped with a
+# warning (reported, not silently clipped). Used as a fallback when the encoder
+# is called without a model handy.
+MAX_CONTEXT_TOKENS = 8192
 
 N_TRAJECTORIES = 18        # target collection size (roughly balanced)
 MAX_SCAN_ROWS = 4000       # cap on streamed rows while hunting for balance
@@ -184,7 +185,7 @@ def load_swebench_trajectories(
 # Replay + compact activation caching (needs the model).
 # --------------------------------------------------------------------------
 def _max_context_tokens(model) -> int:
-    """TransformerLens precomputes rotary embeddings only up to n_ctx."""
+    """The model is loaded with a raised n_ctx (8192); honor it as the ceiling."""
     return int(getattr(model.cfg, "n_ctx", MAX_CONTEXT_TOKENS))
 
 
@@ -194,36 +195,28 @@ def _to_ids(model, text: str) -> list[int]:
     return model.to_tokens(text, prepend_bos=False)[0].tolist()
 
 
-def _preamble_end(turns: list[dict]) -> int:
-    """Index where droppable (user, ai) pairs start — after system + issue user."""
-    i = 0
-    if turns and turns[0]["role"] == "system":
-        i = 1
-    if i < len(turns) and turns[i]["role"] == "user":
-        i += 1
-    return i
+def build_replay_tokens(model, turns: list[dict]):
+    """Concatenate turns into one token sequence, truncating only observations.
 
-
-def _encode_turns(
-    model,
-    turns: list[dict],
-    obs_cap: int,
-    ai_cap: int,
-    max_tokens: int,
-) -> tuple[list[int], list[int]] | tuple[None, None]:
-    """Tokenize turns with per-role caps. Returns (ids, step_positions) or (None, None)."""
+    `ai` (assistant) turns — the reasoning the probe reads — are kept whole; only
+    `user`/`system` observations are head-truncated to OBS_TOKEN_CAP. With the
+    model loaded at n_ctx=8192, whole 8-20 step trajectories fit, so no steps are
+    dropped. Returns (token_ids, step_positions) where step_positions are the
+    absolute indices of each `ai` turn's final token, or (None, None) if the
+    sequence still exceeds n_ctx after observation truncation (then dropped).
+    """
+    max_tokens = _max_context_tokens(model)
     bos = model.tokenizer.bos_token_id
     ids: list[int] = [bos] if bos is not None else []
     step_positions: list[int] = []
 
     for turn in turns:
         role = turn["role"]
+        # A short role tag keeps the replayed text readable as a conversation.
         ids += _to_ids(model, f"\n\n{role}:\n")
         body = _to_ids(model, turn["text"])
-        if role in _OBS_ROLES and len(body) > obs_cap:
-            body = body[:obs_cap]
-        elif role == _STEP_ROLE and len(body) > ai_cap:
-            body = body[:ai_cap]
+        if role in _OBS_ROLES and len(body) > OBS_TOKEN_CAP:
+            body = body[:OBS_TOKEN_CAP]  # head-truncate observation (caveat #2)
         ids += body
         if role == _STEP_ROLE:
             step_positions.append(len(ids) - 1)
@@ -233,62 +226,18 @@ def _encode_turns(
     return ids, step_positions
 
 
-def build_replay_tokens(model, turns: list[dict]):
-    """Concatenate turns into one token sequence, fitting model.cfg.n_ctx.
-
-    Applies observation + ai turn caps, then if still over budget drops the
-    oldest (user, ai) pairs after the issue preamble (system + first user).
-    Returns (token_ids, step_positions, trimmed_turns, note) or (None, None,
-    None, reason) if the trajectory cannot be encoded.
-    """
-    max_tokens = _max_context_tokens(model)
-    working = [{"role": t["role"], "text": t["text"]} for t in turns]
-    obs_cap, ai_cap = OBS_TOKEN_CAP, AI_TOKEN_CAP
-    dropped_pairs = 0
-    preamble = _preamble_end(working)
-
-    while True:
-        encoded = _encode_turns(model, working, obs_cap, ai_cap, max_tokens)
-        if encoded[0] is not None:
-            note = ""
-            if dropped_pairs:
-                note = f"dropped {dropped_pairs} early user/ai pair(s) to fit n_ctx={max_tokens}"
-            if obs_cap < OBS_TOKEN_CAP or ai_cap < AI_TOKEN_CAP:
-                note = (note + "; " if note else "") + f"caps obs={obs_cap} ai={ai_cap}"
-            return encoded[0], encoded[1], working, note
-
-        # Tighten per-turn caps before dropping history.
-        if obs_cap > 32:
-            obs_cap = max(32, obs_cap // 2)
-            continue
-        if ai_cap > 64:
-            ai_cap = max(64, ai_cap // 2)
-            continue
-
-        # Drop the oldest user+ai pair after the issue preamble.
-        if preamble + 2 > len(working):
-            return None, None, None, f"cannot fit in n_ctx={max_tokens} even after truncation"
-
-        del working[preamble : preamble + 2]
-        dropped_pairs += 1
-
-
 def replay_and_cache_activations(model, trajectory: dict) -> dict | None:
     """Replay one trajectory and cache step-boundary resid_post for all layers.
 
     Mutates and returns the trajectory record with the probe-facing fields
     (step_positions=range(n_steps), activation_path, seq_len), and drops `turns`.
-    Returns None if the trajectory cannot fit model.cfg.n_ctx (dropped).
+    Returns None if the trajectory overflows n_ctx after observation truncation.
     """
-    ids, abs_positions, trimmed_turns, note = build_replay_tokens(
-        model, trajectory["turns"]
-    )
+    ids, abs_positions = build_replay_tokens(model, trajectory["turns"])
     if ids is None:
-        print(f"  warning: {trajectory['id'][:24]} — {note}; dropping.", flush=True)
+        print(f"  warning: {trajectory['id'][:24]} over {_max_context_tokens(model)} "
+              f"tokens after observation truncation — dropping.", flush=True)
         return None
-
-    if note:
-        print(f"  note: {trajectory['id'][:24]} — {note}", flush=True)
 
     tokens = torch.tensor([ids], device=model.cfg.device)
     names = [f"blocks.{l}.hook_resid_post" for l in range(model.cfg.n_layers)]
@@ -302,20 +251,13 @@ def replay_and_cache_activations(model, trajectory: dict) -> dict | None:
     path = save_activations(trajectory["id"], compact)
 
     n_steps = len(abs_positions)
-    if n_steps < MIN_STEPS:
-        print(f"  warning: {trajectory['id'][:24]} only {n_steps} steps after "
-              f"truncation (need >={MIN_STEPS}) — dropping.", flush=True)
-        return None
-
     trajectory["step_positions"] = list(range(n_steps))   # probe indexes 0..n-1
     trajectory["n_steps"] = n_steps
     trajectory["seq_len"] = len(ids)
     trajectory["activation_path"] = str(path)
-    if note:
-        trajectory["truncation_note"] = note
     # Keep short step previews for the qualitative read; drop bulky raw turns.
     trajectory["step_texts"] = [
-        t["text"][:200] for t in trimmed_turns if t["role"] == _STEP_ROLE
+        t["text"][:200] for t in trajectory["turns"] if t["role"] == _STEP_ROLE
     ][:n_steps]
     trajectory.pop("turns", None)
     return trajectory

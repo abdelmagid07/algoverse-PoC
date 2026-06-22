@@ -29,6 +29,12 @@ MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 # the most task-relevant signal in prior mech-interp work.
 LAYER = 8
 
+# Context length override. TransformerLens caps Llama-3.2 at n_ctx=2048 by
+# default (its rotary tables are only precomputed that far), which truncated
+# SWE-bench trajectories. Llama-3.2 actually trains to 128k, so 8192 is safely
+# inside the trained range; we set it so long agent trajectories replay whole.
+N_CTX = 8192
+
 # Minimum VRAM to run on GPU. Attribution patching needs a backward pass, which
 # does not fit alongside a 1B model's activations in a small (4 GB) card, so we
 # fall back to CPU there. A Colab T4 (16 GB) clears this easily and is much
@@ -129,11 +135,15 @@ def load_model(device: str | None = None, dtype: torch.dtype | None = None) -> H
         dtype = getattr(torch, env_dtype) if env_dtype else _default_dtype(device)
 
     if device not in _MODEL_CACHE:
+        # n_ctx must be set at load time: rotary embedding buffers are sized
+        # during init, so mutating cfg.n_ctx afterwards would not resize them.
         if dtype == torch.float32:
-            model = HookedTransformer.from_pretrained(MODEL_NAME, device=device, dtype=dtype)
+            model = HookedTransformer.from_pretrained(
+                MODEL_NAME, device=device, dtype=dtype, n_ctx=N_CTX
+            )
         else:
             model = HookedTransformer.from_pretrained_no_processing(
-                MODEL_NAME, device=device, dtype=dtype
+                MODEL_NAME, device=device, dtype=dtype, n_ctx=N_CTX
             )
         model.eval()
         _MODEL_CACHE[device] = model
