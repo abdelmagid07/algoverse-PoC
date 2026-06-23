@@ -18,11 +18,29 @@ import torch
 from transformer_lens import HookedTransformer
 
 # --- Shared constants ------------------------------------------------------
-# Default: 8B instruct for stronger sandbox/SWE-style tool use. Override with
-# VERITAS_MODEL (e.g. meta-llama/Llama-3.2-1B-Instruct or
-# meta-llama/Meta-Llama-3.1-8B-Instruct). Gated: HF token + license acceptance.
-_DEFAULT_MODEL = "meta-llama/Llama-3.2-8B-Instruct"
+# Default: 8B instruct for stronger sandbox tool use. TransformerLens supports
+# Llama 3.1 8B (there is no Llama 3.2 8B — 3.2 only ships 1B/3B). Override:
+# VERITAS_MODEL=meta-llama/Llama-3.2-1B-Instruct etc. Gated: HF token + license.
+_DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 MODEL_NAME = os.environ.get("VERITAS_MODEL", _DEFAULT_MODEL)
+
+# Common mistake: "Llama-3.2-8B" does not exist on HF or in TransformerLens.
+_TL_8B_FALLBACK = "meta-llama/Llama-3.1-8B-Instruct"
+
+
+def resolve_model_name(name: str = MODEL_NAME) -> str:
+    """Map env model id to a TransformerLens-official name; fail with a clear hint."""
+    lower = name.lower()
+    if "3.2" in lower and "8b" in lower:
+        print(
+            f"Note: {name} is not a real checkpoint (Llama 3.2 has no 8B). "
+            f"Using {_TL_8B_FALLBACK} instead.",
+            flush=True,
+        )
+        name = _TL_8B_FALLBACK
+    from transformer_lens.loading_from_pretrained import get_official_model_name
+
+    return get_official_model_name(name)
 
 
 def _is_8b_model(name: str = MODEL_NAME) -> bool:
@@ -151,9 +169,10 @@ def load_model(device: str | None = None, dtype: torch.dtype | None = None) -> H
     n_ctx = default_n_ctx()
     key = _cache_key(device, dtype)
     if key not in _MODEL_CACHE:
-        print(f"Loading {MODEL_NAME} (n_ctx={n_ctx}, dtype={dtype}, device={device})...",
+        tl_name = resolve_model_name()
+        print(f"Loading {tl_name} (n_ctx={n_ctx}, dtype={dtype}, device={device})...",
               flush=True)
-        if _is_8b_model() and device == "cuda":
+        if _is_8b_model(tl_name) and device == "cuda":
             try:
                 vram = torch.cuda.get_device_properties(0).total_memory
                 if vram < 15 * 1024 ** 3:
@@ -167,11 +186,11 @@ def load_model(device: str | None = None, dtype: torch.dtype | None = None) -> H
                 pass
         if dtype == torch.float32:
             model = HookedTransformer.from_pretrained(
-                MODEL_NAME, device=device, dtype=dtype, n_ctx=n_ctx
+                tl_name, device=device, dtype=dtype, n_ctx=n_ctx
             )
         else:
             model = HookedTransformer.from_pretrained_no_processing(
-                MODEL_NAME, device=device, dtype=dtype, n_ctx=n_ctx
+                tl_name, device=device, dtype=dtype, n_ctx=n_ctx
             )
         model.eval()
         _MODEL_CACHE[key] = model
