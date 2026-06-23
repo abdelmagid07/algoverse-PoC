@@ -60,10 +60,51 @@ def _gpu_vram_bytes() -> int | None:
         return None
 
 
+def _system_ram_bytes() -> int | None:
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().total)
+    except ImportError:
+        return None
+
+
+def _is_colab_low_ram() -> bool:
+    """Colab free tier (~12 GB) cannot survive TL's 3B CPU staging spike."""
+    if not os.environ.get("COLAB_RELEASE_TAG"):
+        return False
+    ram = _system_ram_bytes()
+    if ram is None:
+        return True
+    return ram < int(13.5 * 1024**3)
+
+
+def _is_large_model(name: str) -> bool:
+    n = name.lower()
+    return _is_8b_model(name) or "3b" in n or "-3-" in n
+
+
 def effective_model_name(device: str) -> str:
-    """Resolve env model id; downgrade 8B on GPUs that cannot fit fp16 weights."""
+    """Resolve env model id; downgrade 8B on small VRAM, 3B on low Colab RAM."""
     requested = os.environ.get("VERITAS_MODEL", _DEFAULT_MODEL)
     tl_name = resolve_model_name(requested)
+
+    if (
+        _is_colab_low_ram()
+        and _is_large_model(tl_name)
+        and not os.environ.get("VERITAS_FORCE_MODEL")
+    ):
+        ram_gb = (_system_ram_bytes() or 0) / 1e9
+        print(
+            f"Note: Colab has ~{ram_gb:.0f} GB system RAM — TransformerLens needs a "
+            f"large CPU spike while converting weights (HF model + TL copy). "
+            f"Using {_MODEL_1B} instead of {tl_name}.\n"
+            f"  To try 3B anyway (may crash): VERITAS_FORCE_MODEL=1 "
+            f"VERITAS_MODEL={_MODEL_3B}\n"
+            f"  Reliable 3B: Colab Pro A100/L4 with more RAM.",
+            flush=True,
+        )
+        return resolve_model_name(_MODEL_1B)
 
     if device != "cuda" or not _is_8b_model(tl_name):
         return tl_name
@@ -204,6 +245,57 @@ def _default_dtype(device: str) -> torch.dtype:
     return torch.float16  # T4 (Turing) lacks native bf16; fp16 is the safe GPU choice
 
 
+def _hf_pretrained_kwargs(device: str, dtype: torch.dtype) -> dict:
+    """HF kwargs that keep weight staging off Colab's ~12 GB system RAM when possible."""
+    kwargs: dict = {"low_cpu_mem_usage": True, "torch_dtype": dtype}
+    if device == "cuda":
+        kwargs["device_map"] = {"": 0}
+    return kwargs
+
+
+def _load_hooked_transformer(
+    tl_name: str,
+    device: str,
+    dtype: torch.dtype,
+    n_ctx: int,
+) -> HookedTransformer:
+    """Load via TL with GPU-first HF staging to reduce peak system RAM."""
+    from transformers import AutoModelForCausalLM
+
+    hf_kwargs = _hf_pretrained_kwargs(device, dtype)
+    hf_model = None
+    if device == "cuda":
+        print("Staging HF weights on GPU (low_cpu_mem_usage)...", flush=True)
+        token = os.environ.get("HF_TOKEN") or None
+        hf_model = AutoModelForCausalLM.from_pretrained(tl_name, token=token, **hf_kwargs)
+        free_runtime_memory()
+
+    tl_kwargs = dict(hf_kwargs)
+    if hf_model is not None:
+        tl_kwargs["hf_model"] = hf_model
+
+    try:
+        if dtype == torch.float32:
+            return HookedTransformer.from_pretrained(
+                tl_name,
+                device=device,
+                dtype=dtype,
+                n_ctx=n_ctx,
+                **tl_kwargs,
+            )
+        return HookedTransformer.from_pretrained_no_processing(
+            tl_name,
+            device=device,
+            dtype=dtype,
+            n_ctx=n_ctx,
+            **tl_kwargs,
+        )
+    finally:
+        if hf_model is not None:
+            del hf_model
+            free_runtime_memory()
+
+
 def load_model(device: str | None = None, dtype: torch.dtype | None = None) -> HookedTransformer:
     """Load the PoC model via TransformerLens (cached per-process).
 
@@ -238,14 +330,7 @@ def load_model(device: str | None = None, dtype: torch.dtype | None = None) -> H
                 "confirm Runtime > T4 GPU + restart.",
                 flush=True,
             )
-        if dtype == torch.float32:
-            model = HookedTransformer.from_pretrained(
-                tl_name, device=device, dtype=dtype, n_ctx=n_ctx
-            )
-        else:
-            model = HookedTransformer.from_pretrained_no_processing(
-                tl_name, device=device, dtype=dtype, n_ctx=n_ctx
-            )
+        model = _load_hooked_transformer(tl_name, device, dtype, n_ctx)
         model.eval()
         param_dev = next(model.parameters()).device
         print(f"Load complete — parameters on {param_dev}.", flush=True)
