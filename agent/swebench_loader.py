@@ -65,8 +65,9 @@ TRAJ_PATH = RESULTS_DIR / "trajectories.json"
 MIN_STEPS = 8
 MAX_STEPS = 20
 
-N_TRAJECTORIES = 18        # target collection size (roughly balanced)
+N_TRAJECTORIES = 18        # target collection size
 MAX_SCAN_ROWS = 4000       # cap on streamed rows while hunting for balance
+MAX_PER_INSTANCE = int(__import__("os").environ.get("VERITAS_K_PER_TASK", "4"))
 
 _OBS_ROLES = {"user", "system"}
 
@@ -121,18 +122,12 @@ def load_swebench_trajectories(
     min_steps: int = MIN_STEPS,
     max_steps: int = MAX_STEPS,
     max_scan_rows: int = MAX_SCAN_ROWS,
-    max_per_instance: int = 3,
+    max_per_instance: int = MAX_PER_INSTANCE,
 ) -> list[dict]:
-    """Stream the dataset and collect ~n trajectories with roughly balanced labels.
+    """Stream the dataset and collect ~n trajectories across distinct instances.
 
-    Positives (`target=True`) are rare (~17% in the spike), so we bucket by label
-    and try to fill n//2 of each within max_scan_rows. We report the actual
-    balance and never fabricate or force it.
-
-    `max_per_instance` caps how many attempts of the SAME SWE-bench task we keep:
-    consecutive rows are repeated attempts at one instance, so without this the
-    probe could learn instance identity instead of success/failure. We spread the
-    sample across distinct tasks instead.
+    No manual label balancing — mixed outcomes are filtered post-load via
+    analysis.dataset_validate.filter_mixed_tasks().
     """
     from datasets import load_dataset
 
@@ -141,9 +136,7 @@ def load_swebench_trajectories(
           f"<= {max_per_instance}/instance)...", flush=True)
     ds = load_dataset(DATASET, split="train", streaming=True)
 
-    per_class = max(1, n // 2)
-    pos: list[dict] = []
-    neg: list[dict] = []
+    collected: list[dict] = []
     per_instance: dict[str, int] = {}
     scanned = 0
     for row in ds:
@@ -155,23 +148,17 @@ def load_swebench_trajectories(
             continue
         if per_instance.get(rec["instance_id"], 0) >= max_per_instance:
             continue
-        bucket = pos if rec["success"] else neg
-        if len(bucket) < per_class:
-            bucket.append(rec)
-            per_instance[rec["instance_id"]] = per_instance.get(rec["instance_id"], 0) + 1
-        if len(pos) >= per_class and len(neg) >= per_class:
+        if len(collected) >= n:
             break
+        collected.append(rec)
+        per_instance[rec["instance_id"]] = per_instance.get(rec["instance_id"], 0) + 1
 
-    out = pos + neg
-    # If one class is short, top up from the other so we still reach ~n usable
-    # examples (probe handles imbalance via AUC + majority-class chance baseline).
-    if len(out) < n:
-        print(f"  note: only {len(pos)} pos / {len(neg)} neg within scan budget; "
-              f"reporting actual balance (not forcing).", flush=True)
+    out = collected
 
+    n_success = sum(1 for r in out if r["success"])
     n_instances = len({r["instance_id"] for r in out})
     print(f"Collected {len(out)} trajectories "
-          f"(success={len(pos)}, fail={len(neg)}) across {n_instances} distinct "
+          f"(success={n_success}, fail={len(out) - n_success}) across {n_instances} distinct "
           f"instances after scanning {scanned} rows.", flush=True)
     return out
 

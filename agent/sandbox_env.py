@@ -151,7 +151,6 @@ def execute_action(sandbox: Sandbox, action: dict) -> str:
 
 def initial_user_message(task: TaskSpec) -> str:
     return (
-        f"Task ID: {task.id}\n"
         f"Problem: {task.problem}\n\n"
         f"Workspace files: {SOLUTION_FILE}\n"
         f"Read {SOLUTION_FILE}, fix the bug, run_tests to check, then finish when done."

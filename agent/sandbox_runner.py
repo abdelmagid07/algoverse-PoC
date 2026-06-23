@@ -4,6 +4,9 @@ Unlike foreign-trajectory replay (agent/swebench_loader.py), Llama-3.2-1B acts
 in a lightweight Python sandbox: read/write solution.py, run hidden tests, finish.
 Success is live eval (tests pass), not a dataset label.
 
+v2 design: K trajectories per task (different seeds / sampling noise) so labels
+are not isomorphic to task identity.
+
 Outputs the same probe contract:
   * results/trajectories.json
   * data/activations/{id}.pt  — compact [n_steps, d_model] at ai step boundaries
@@ -14,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 
 import torch
@@ -35,8 +39,13 @@ MAX_STEPS = 15
 MAX_AGENT_STEPS = 15
 MAX_NEW_TOKENS = 320
 FREQ_PENALTY = 1.0
-N_TRAJECTORIES = 20
-MAX_PER_INSTANCE = 1
+
+N_TASKS_TARGET = int(os.environ.get("VERITAS_N_TASKS", "50"))
+K_TRAJECTORIES_PER_TASK = int(os.environ.get("VERITAS_K_PER_TASK", "4"))
+TEMPERATURE = float(os.environ.get("VERITAS_TEMPERATURE", "0.7"))
+
+# Legacy alias for pipeline code that still references total trajectory budget.
+N_TRAJECTORIES = N_TASKS_TARGET * K_TRAJECTORIES_PER_TASK
 
 
 def _traj_id(task_id: str, seed: int) -> str:
@@ -49,7 +58,7 @@ def _turns_to_messages(turns: list[dict]) -> list[dict]:
     return [{"role": role_map[t["role"]], "content": t["text"]} for t in turns]
 
 
-def _generate_ai_turn(model, turns: list[dict]) -> str:
+def _generate_ai_turn(model, turns: list[dict], *, temperature: float) -> str:
     messages = _turns_to_messages(turns)
     prompt_str = model.tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -58,7 +67,8 @@ def _generate_ai_turn(model, turns: list[dict]) -> str:
     out = model.generate(
         tokens,
         max_new_tokens=MAX_NEW_TOKENS,
-        do_sample=False,
+        do_sample=True,
+        temperature=temperature,
         freq_penalty=FREQ_PENALTY,
         use_past_kv_cache=True,
         stop_at_eos=True,
@@ -111,8 +121,17 @@ def parse_action(text: str) -> dict | None:
     return None
 
 
-def run_live_trajectory(model, task, seed: int = 0) -> dict | None:
+def run_live_trajectory(
+    model,
+    task,
+    seed: int = 0,
+    *,
+    temperature: float = TEMPERATURE,
+) -> dict | None:
     """Run one multi-turn sandbox episode; return record with `turns` or None."""
+    torch.manual_seed(seed)
+    random.seed(seed)
+
     traj_id = _traj_id(task.id, seed)
     sandbox = Sandbox(task, traj_id)
 
@@ -125,7 +144,7 @@ def run_live_trajectory(model, task, seed: int = 0) -> dict | None:
 
     try:
         for _ in range(MAX_AGENT_STEPS):
-            ai_text = _generate_ai_turn(model, turns)
+            ai_text = _generate_ai_turn(model, turns, temperature=temperature)
             if not ai_text:
                 break
             turns.append({"role": "ai", "text": ai_text})
@@ -151,7 +170,6 @@ def run_live_trajectory(model, task, seed: int = 0) -> dict | None:
                 finished = True
                 break
 
-            # Early context check — drop before wasting more GPU time.
             ids, _ = build_replay_tokens(model, turns)
             if ids is None:
                 print(f"  warning: {traj_id[:24]} exceeded context mid-run — dropping.",
@@ -174,6 +192,8 @@ def run_live_trajectory(model, task, seed: int = 0) -> dict | None:
         "source": "live_sandbox",
         "success": success,
         "finished": finished,
+        "seed": seed,
+        "temperature": temperature,
         "turns": turns,
         "n_steps": n_ai,
     }
@@ -181,92 +201,71 @@ def run_live_trajectory(model, task, seed: int = 0) -> dict | None:
 
 
 def load_sandbox_task_list(
-    n: int = N_TRAJECTORIES,
-    max_per_instance: int = MAX_PER_INSTANCE,
+    n_tasks: int = N_TASKS_TARGET,
     smoke_n: int | None = None,
 ) -> list:
-    """Shuffled tasks with at most one attempt per task id."""
+    """Shuffled tasks for collection (up to n_tasks)."""
     tasks = load_tasks()
     if smoke_n is not None:
         return tasks[:smoke_n]
-    # Shuffle deterministically for reproducibility across runs.
-    import random
     rng = random.Random(0)
     shuffled = tasks.copy()
     rng.shuffle(shuffled)
-    seen: set[str] = set()
-    out = []
-    for t in shuffled:
-        if t.id in seen:
-            continue
-        if len(seen) >= max_per_instance * n:
-            break
-        seen.add(t.id)
-        out.append(t)
-        if len(out) >= n:
-            break
-    return out
+    return shuffled[: min(n_tasks, len(shuffled))]
 
 
 def collect_trajectories(
     model,
-    n: int = N_TRAJECTORIES,
+    n_tasks: int = N_TASKS_TARGET,
+    k_per_task: int = K_TRAJECTORIES_PER_TASK,
     smoke_n: int | None = None,
     existing: list[dict] | None = None,
 ) -> list[dict]:
-    """Collect up to n valid trajectories; may scan extra tasks if steps filter drops some."""
-    tasks = load_tasks()
+    """Collect K trajectories per task across n_tasks (v2 within-task design)."""
     if smoke_n is not None:
-        candidate_tasks = tasks[:smoke_n * 3]  # extra headroom when step filter drops runs
-    else:
-        import random
-        rng = random.Random(0)
-        candidate_tasks = tasks.copy()
-        rng.shuffle(candidate_tasks)
+        n_tasks = smoke_n
+        k_per_task = min(3, k_per_task)
+
+    candidate_tasks = load_sandbox_task_list(n_tasks=n_tasks, smoke_n=smoke_n)
 
     trajectories: list[dict] = list(existing or [])
-    used_tasks: set[str] = {t["instance_id"] for t in trajectories}
-    task_idx = 0
+    done_keys: set[tuple[str, int]] = {
+        (t["instance_id"], t.get("seed", 0)) for t in trajectories
+    }
 
-    while len(trajectories) < n and task_idx < len(candidate_tasks):
-        task = candidate_tasks[task_idx]
-        task_idx += 1
-        if task.id in used_tasks:
-            continue
-        used_tasks.add(task.id)
+    total_target = n_tasks * k_per_task
+    print(
+        f"Collecting {k_per_task} trajectories x {len(candidate_tasks)} tasks "
+        f"(target {total_target} total, step band [{MIN_STEPS},{MAX_STEPS}])",
+        flush=True,
+    )
 
-        print(f"  [{len(trajectories)+1}/{n}] task={task.id} ...", flush=True)
-        raw = run_live_trajectory(model, task)
-        if raw is None:
-            continue
-        done = finalize_trajectory_from_turns(model, raw, raw["turns"])
-        if done is None:
-            continue
-        trajectories.append(done)
-        TRAJ_PATH.write_text(json.dumps(trajectories, indent=2), encoding="utf-8")
-        print(
-            f"  saved id={done['id'][:24]} steps={done['n_steps']} "
-            f"success={done['success']} seq_len={done['seq_len']}",
-            flush=True,
-        )
-        free_runtime_memory()
-
-    if len(trajectories) < n and smoke_n is None:
-        for task in candidate_tasks:
-            if len(trajectories) >= n:
-                break
-            if task.id in used_tasks:
+    for task in candidate_tasks:
+        for seed in range(k_per_task):
+            if (task.id, seed) in done_keys:
                 continue
-            used_tasks.add(task.id)
-            print(f"  [extra] task={task.id} ...", flush=True)
-            raw = run_live_trajectory(model, task)
+            print(
+                f"  [{len(trajectories)+1}/{total_target}] "
+                f"task={task.id} seed={seed} ...",
+                flush=True,
+            )
+            raw = run_live_trajectory(model, task, seed=seed)
             if raw is None:
                 continue
             done = finalize_trajectory_from_turns(model, raw, raw["turns"])
             if done is None:
                 continue
+            done["seed"] = seed
+            done["temperature"] = TEMPERATURE
             trajectories.append(done)
+            done_keys.add((task.id, seed))
             TRAJ_PATH.write_text(json.dumps(trajectories, indent=2), encoding="utf-8")
+            print(
+                f"  saved id={done['id'][:24]} steps={done['n_steps']} "
+                f"success={done['success']} seq_len={done['seq_len']}",
+                flush=True,
+            )
+            free_runtime_memory()
 
     return trajectories
 
@@ -274,7 +273,6 @@ def collect_trajectories(
 def main() -> None:
     smoke = os.environ.get("VERITAS_SMOKE_N")
     smoke_n = int(smoke) if smoke else None
-    n = smoke_n or N_TRAJECTORIES
 
     model = load_model()
     print(
@@ -283,17 +281,17 @@ def main() -> None:
         flush=True,
     )
     print(
-        f"Live sandbox collect: target={n} trajectories, "
-        f"step band [{MIN_STEPS},{MAX_STEPS}]",
+        f"Live sandbox collect v2: {N_TASKS_TARGET} tasks x "
+        f"{K_TRAJECTORIES_PER_TASK} seeds, temperature={TEMPERATURE}",
         flush=True,
     )
 
-    trajectories = collect_trajectories(model, n=n, smoke_n=smoke_n)
+    trajectories = collect_trajectories(model, smoke_n=smoke_n)
     n_success = sum(t["success"] for t in trajectories)
     print(f"\nSaved {len(trajectories)} trajectories to {TRAJ_PATH}", flush=True)
     print(
         f"Success: {n_success}/{len(trajectories)}  |  "
-        f"steps/traj: {[t['n_steps'] for t in trajectories]}",
+        f"tasks: {len({t['instance_id'] for t in trajectories})}",
         flush=True,
     )
 

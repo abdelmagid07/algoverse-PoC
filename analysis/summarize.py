@@ -1,17 +1,7 @@
-"""Phase 4: auto-generate results/poc_summary.md from the probe results.
+"""Phase 4: auto-generate results/poc_summary.md from v2 probe results.
 
-Reproducible (so it regenerates identically on Colab) and honest: it reports the
-class balance, the majority-class chance baseline, the cross-validation spread
-(not just means), how many layers show the early->late increase, and the
-high-dimensional / low-N regularization caveat.
-
-Decision rule (from NEW_PROPOSAL_POC_GUIDE.md), applied to relative-position bins:
-  * STRONG     - accuracy clearly above chance AND clearly increasing early->late
-                 on a meaningful number of layers -> green light.
-  * CAUTIOUS   - above chance somewhere but roughly flat across position ->
-                 pursue, but reframe from "early forecasting" to "internal state
-                 correlates with outcome."
-  * NO SIGNAL  - near chance everywhere -> do not pursue; fall back to Idea 4.
+Decision rule uses within-task AUC and LOTO AUC (not global accuracy).
+Global metrics are reported as deprecated confounded baselines.
 
 Run:  python -m analysis.summarize
 """
@@ -25,26 +15,12 @@ from interp.activation_cache import MODEL_NAME, RESULTS_DIR
 
 PROBE_PATH = RESULTS_DIR / "probe_results.json"
 OUT_PATH = RESULTS_DIR / "poc_summary.md"
+SKEPTICISM_JSON = RESULTS_DIR / "skepticism_report.json"
 SKEPTICISM_MD = RESULTS_DIR / "skepticism_report.md"
 
-# Margins, deliberately conservative given the small-N noise.
-CHANCE_MARGIN = 0.10   # accuracy must beat chance by this to count as "signal"
-INCREASE_MARGIN = 0.10  # late-minus-early delta to count as "increasing"
-
-# Prior HotpotQA run, recorded as labeled constants for the side-by-side
-# comparison (C.3). HotpotQA trajectories were ~3 steps, too short to test the
-# early->late forecasting hypothesis; this is the baseline the SWE-bench
-# migration is meant to beat. Source: the HotpotQA probe summary.
-# Prior foreign-replay SWE-bench run (for A/B comparison in summary).
-REPLAY_BASELINE = {
-    "domain": "SWE-bench replay (foreign agent, 18 traj)",
-    "chance": 0.500,
-    "delta": -0.137,
-    "increasing_layers": 2,
-    "n_layers": 16,
-    "band": "CAUTIOUS",
-    "note": "Replay measured Llama reading another agent's transcript — not self-forecasting.",
-}
+AUC_THRESHOLD = 0.55
+SHUFFLE_DROP_MIN = 0.15
+TEXT_MARGIN = 0.05
 
 
 def _trajectory_source() -> str:
@@ -61,170 +37,123 @@ def _trajectory_source() -> str:
     return "replay"
 
 
-def _bin_layer_arrays(payload: dict):
-    """Return dict bin_idx -> np.array of per-layer acc_mean (NaN where missing)."""
+def _metric_grid(payload: dict, key: str) -> np.ndarray:
     n_layers = payload["n_layers"]
     n_bins = len(payload["bins"])
     grid = np.full((n_layers, n_bins), np.nan)
-    std = np.full((n_layers, n_bins), np.nan)
-    auc = np.full((n_layers, n_bins), np.nan)
     for r in payload["results"]:
-        if r["acc_mean"] is not None:
-            grid[r["layer"], r["bin_idx"]] = r["acc_mean"]
-            std[r["layer"], r["bin_idx"]] = r["acc_std"]
-        if r["auc"] is not None:
-            auc[r["layer"], r["bin_idx"]] = r["auc"]
-    return grid, std, auc
+        val = r.get(key)
+        if val is not None:
+            grid[r["layer"], r["bin_idx"]] = val
+    return grid
 
 
-def classify(payload: dict) -> dict:
-    grid, std, auc = _bin_layer_arrays(payload)
+def classify_v2(payload: dict, skepticism: dict | None) -> dict:
+    within = _metric_grid(payload, "within_task_micro_auc")
+    loto = _metric_grid(payload, "loto_auc")
     bins = payload["bins"]
-    chance = payload["overall_chance"]
-    n_layers = payload["n_layers"]
 
-    per_bin_mean = np.nanmean(grid, axis=0)   # mean over layers
-    per_bin_spread = np.nanstd(grid, axis=0)  # spread over layers
-    per_bin_auc = np.nanmean(auc, axis=0)
+    per_bin_within = np.nanmean(within, axis=0)
+    per_bin_loto = np.nanmean(loto, axis=0)
+
+    best_within = float(np.nanmax(within)) if np.isfinite(within).any() else None
+    best_loto = float(np.nanmax(loto)) if np.isfinite(loto).any() else None
 
     early_i, late_i = 0, len(bins) - 1
-    early_mean = per_bin_mean[early_i]
-    late_mean = per_bin_mean[late_i]
-    delta = late_mean - early_mean
+    wt_delta = per_bin_within[late_i] - per_bin_within[early_i]
 
-    # Per-layer early->late increase that also clears chance at the late bin.
-    layer_delta = grid[:, late_i] - grid[:, early_i]
-    increasing_layers = int(np.nansum(
-        (layer_delta > INCREASE_MARGIN) & (grid[:, late_i] > chance + CHANCE_MARGIN)
-    ))
+    checks = skepticism.get("checks", {}) if skepticism else {}
+    shuffle_drop = checks.get("within_instance_shuffle", {}).get("auc_drop")
+    wt_act = checks.get("activation_within_task", {}).get("micro_auc")
+    text_wt = checks.get("text_baseline_within_task", {}).get("within_task_micro_auc")
 
-    above_chance_anywhere = np.nanmax(per_bin_mean) > chance + CHANCE_MARGIN
-    increasing = (delta > INCREASE_MARGIN) and (late_mean > chance + CHANCE_MARGIN) \
-        and (increasing_layers >= max(1, round(0.25 * n_layers)))
+    conditions = {
+        "within_task_above_chance": best_within is not None and best_within > AUC_THRESHOLD,
+        "loto_above_chance": best_loto is not None and best_loto > AUC_THRESHOLD,
+        "shuffle_breaks_signal": shuffle_drop is not None and shuffle_drop >= SHUFFLE_DROP_MIN,
+        "activation_beats_text": (
+            wt_act is not None and text_wt is not None
+            and wt_act > text_wt + TEXT_MARGIN
+        ),
+    }
 
-    if not above_chance_anywhere:
-        band = "no_signal"
+    n_pass = sum(conditions.values())
+    if n_pass >= 3 and conditions["within_task_above_chance"]:
+        band = "validated"
         action = (
-            "Accuracy stays near chance at every relative position and layer. No "
-            "usable signal at this scale - do not pursue as the primary direction; "
-            "fall back to Idea 4 (goal drift)."
+            "v2 controls largely pass: within-task and/or LOTO AUC above chance, "
+            "shuffle ablation and text baseline support internal trajectory signal. "
+            "Proceed with scaled-up collection."
         )
-    elif increasing:
-        band = "strong"
-        action = (
-            "Outcome decodability is clearly above chance and increases from the "
-            "early to the late portion of trajectories on multiple layers. Strong "
-            "signal at small scale - green light to pursue as the primary direction."
-        )
-    else:
+    elif conditions["within_task_above_chance"] or conditions["loto_above_chance"]:
         band = "cautious"
         action = (
-            "Outcome decodability is above chance but does not clearly increase "
-            "toward the end of trajectories. Some signal exists, but the "
-            "'forecasting before the outcome is visible' story is weaker than hoped "
-            "- pursue with caution and reframe around 'internal state correlates "
-            "with outcome' rather than 'early forecasting.'"
+            "Partial v2 signal: some within-task or LOTO AUC above chance, but not all "
+            "validation conditions met. Do not claim latent forecasting without "
+            "passing shuffle and text baselines."
+        )
+    else:
+        band = "no_signal"
+        action = (
+            "No within-task or LOTO signal above threshold. The probe is not decoding "
+            "trajectory outcome within tasks — do not pursue without redesign."
         )
 
     return {
         "band": band,
         "action": action,
-        "chance": chance,
-        "per_bin_mean": per_bin_mean,
-        "per_bin_spread": per_bin_spread,
-        "per_bin_auc": per_bin_auc,
-        "delta": delta,
-        "increasing_layers": increasing_layers,
-        "grid": grid,
-        "std": std,
+        "best_within_auc": best_within,
+        "best_loto_auc": best_loto,
+        "per_bin_within": per_bin_within,
+        "per_bin_loto": per_bin_loto,
+        "wt_delta": wt_delta,
+        "conditions": conditions,
+        "within_grid": within,
+        "loto_grid": loto,
     }
 
 
 def main() -> None:
     payload = json.loads(PROBE_PATH.read_text(encoding="utf-8"))
+    skepticism = None
+    if SKEPTICISM_JSON.exists():
+        skepticism = json.loads(SKEPTICISM_JSON.read_text(encoding="utf-8"))
+
     bins = payload["bins"]
     n = payload["n_trajectories"]
     n_success = payload["n_success"]
     n_fail = payload["n_fail"]
-    chance = payload["overall_chance"]
 
-    c = classify(payload)
-    grid, std = c["grid"], c["std"]
+    c = classify_v2(payload, skepticism)
 
-    # Best layer at the late bin (for an honest "spread, not just mean" callout).
-    late_i = len(bins) - 1
-    late_col = grid[:, late_i]
-    if np.isfinite(late_col).any():
-        best_layer = int(np.nanargmax(late_col))
-        best_late = late_col[best_layer]
-        best_late_std = std[best_layer, late_i]
-        best_str = (f"layer {best_layer}: {best_late:.3f} +/- {best_late_std:.3f} "
-                    f"(fold spread)")
-    else:
-        best_str = "n/a (late bin not probeable)"
+    best_layer_within = int(np.unravel_index(np.nanargmax(c["within_grid"]), c["within_grid"].shape)[0])
+    best_wt = c["best_within_auc"]
+    best_loto = c["best_loto_auc"]
 
-    # Per-bin table rows.
     bin_rows = []
     for j, name in enumerate(bins):
-        m = c["per_bin_mean"][j]
-        sp = c["per_bin_spread"][j]
-        au = c["per_bin_auc"][j]
-        cells = [r for r in payload["results"] if r["bin_idx"] == j]
-        ns = [r["n"] for r in cells]
-        nrow = ns[0] if ns else 0
-        npos = cells[0]["n_pos"] if cells else 0
-        nneg = cells[0]["n_neg"] if cells else 0
-        m_str = "n/a" if np.isnan(m) else f"{m:.3f}"
-        sp_str = "n/a" if np.isnan(sp) else f"{sp:.3f}"
-        au_str = "n/a" if np.isnan(au) else f"{au:.3f}"
-        bin_rows.append(
-            f"| {name} | {m_str} | {sp_str} | {au_str} | {nrow} ({npos}+/{nneg}-) |"
-        )
+        wt = c["per_bin_within"][j]
+        lo = c["per_bin_loto"][j]
+        wt_str = "n/a" if np.isnan(wt) else f"{wt:.3f}"
+        lo_str = "n/a" if np.isnan(lo) else f"{lo:.3f}"
+        bin_rows.append(f"| {name} | {wt_str} | {lo_str} |")
 
-    band_label = {"strong": "STRONG", "cautious": "CAUTIOUS", "no_signal": "NO SIGNAL"}[c["band"]]
+    band_label = {
+        "validated": "VALIDATED (v2)",
+        "cautious": "CAUTIOUS (v2)",
+        "no_signal": "NO SIGNAL (v2)",
+    }[c["band"]]
+
+    cond = c["conditions"]
+    cond_rows = "\n".join([
+        f"| Within-task AUC > {AUC_THRESHOLD} | {'PASS' if cond['within_task_above_chance'] else 'FAIL'} |",
+        f"| LOTO AUC > {AUC_THRESHOLD} | {'PASS' if cond['loto_above_chance'] else 'FAIL'} |",
+        f"| Shuffle drop >= {SHUFFLE_DROP_MIN} | {'PASS' if cond['shuffle_breaks_signal'] else 'FAIL'} |",
+        f"| Activation > text + {TEXT_MARGIN} | {'PASS' if cond['activation_beats_text'] else 'FAIL'} |",
+    ])
+
     source = _trajectory_source()
     is_live = source == "live_sandbox"
-
-    # --- Prior replay vs this run (A/B) ---------------------------------------
-    prior = REPLAY_BASELINE
-    domain_this = "Live sandbox (Llama self-generated, 6-15 steps)" if is_live else "SWE-bench replay (foreign agent)"
-    comparison_rows = "\n".join([
-        "| Metric | Prior replay run | This run |",
-        "|---|---|---|",
-        f"| Domain | {prior['domain']} | {domain_this} |",
-        f"| Chance baseline | {prior['chance']:.3f} | {chance:.3f} |",
-        f"| Early->late delta (mean over layers) | {prior['delta']:+.3f} | {c['delta']:+.3f} |",
-        f"| Layers showing the increase | {prior['increasing_layers']}/{prior['n_layers']} | "
-        f"{c['increasing_layers']}/{payload['n_layers']} |",
-        f"| Decision band | {prior['band']} | {band_label} |",
-    ])
-    if is_live:
-        interpretation = (
-            "This run uses **Llama generating and executing** its own coding trajectories; "
-            "labels come from live hidden tests, not foreign transcripts. The research "
-            "question is whether decodability exists **somewhere** along the trajectory "
-            "(peak layer/bin), not whether it monotonically grows early→late. "
-            "Compare skepticism task-holdout and stripped-text baselines before trusting "
-            "activation signal."
-        )
-    elif c["band"] == "no_signal":
-        interpretation = (
-            "Still null at proper trajectory length. Outcome is not linearly decodable "
-            "from the residual stream at this scale."
-        )
-    else:
-        interpretation = (
-            "Signal on replayed foreign trajectories — interpret with caution; see "
-            "foreign-replay caveat. Prefer live-sandbox results for self-forecasting claims."
-        )
-
-    imbalance_note = ""
-    if min(n_success, n_fail) < 0.3 * n:
-        imbalance_note = (
-            f" Class balance is skewed ({n_success} success / {n_fail} fail), so "
-            "accuracy is read against the majority-class chance baseline above, and "
-            "AUC is the more trustworthy metric here."
-        )
 
     skepticism_block = ""
     if SKEPTICISM_MD.exists():
@@ -234,116 +163,64 @@ def main() -> None:
             + "\n"
         )
 
-    domain_label = "live Python sandbox" if is_live else "SWE-bench replay"
-    if is_live:
-        domain_caveats = f"""### Live sandbox caveats (flagged, not silently fixed)
-
-5. **Step-boundary convention.** One step = one `ai` (assistant) turn; its step
-   position is that turn's final token; `user`/`system` turns are observations,
-   not steps.
-6. **Observation truncation.** `user`/`system` observations are head-truncated to
-   a fixed token cap; `ai` turns are kept whole. Rare trajectories over `n_ctx`
-   after truncation are dropped (and logged).
-7. **Sandbox domain.** Single-file Python repairs in a temp directory — not real
-   SWE-bench repos or Docker eval. Success = hidden unit tests pass.
-8. **Same-agent generate + probe.** `{MODEL_NAME}` both acts and is probed; labels
-   reflect its own test outcomes. Still correlational, not causal.
-9. **Model capability.** Smaller models fail more tasks; class balance reflects
-   model ability. Tool JSON parsing may fail on small models. Default is 8B;
-   override with `VERITAS_MODEL` if VRAM is insufficient."""
-        reproduce = """```bash
-python run_pipeline.py          # live collect + probe + skepticism + summarize
-VERITAS_SMOKE_N=2 python run_pipeline.py   # quick smoke (2 trajectories)
-# legacy foreign replay:
-VERITAS_TRAJECTORY_SOURCE=replay python run_pipeline.py
-```"""
-    else:
-        domain_caveats = """### SWE-bench replay caveats (legacy mode)
-
-5. **Foreign-trajectory replay.** Trajectories were generated by other agents;
-   Llama reads their text. Labels come from dataset `target`, not live eval.
-6. **Step-boundary / truncation.** Same conventions as live sandbox (ai turn =
-   one step; observations truncated)."""
-        reproduce = """```bash
-VERITAS_TRAJECTORY_SOURCE=replay python run_pipeline.py
-python -m agent.swebench_loader
-```"""
-
-    md = f"""# Latent Failure Forecasting PoC - Results Summary
+    md = f"""# Latent Failure Forecasting PoC v2 — Results Summary
 
 _Auto-generated by `analysis/summarize.py` from `results/probe_results.json`._
 
-## Verdict
+## Verdict (v2 primary metrics)
 
 | Metric | Value |
 |---|---|
 | Model | `{MODEL_NAME}` |
-| Trajectories | {n} (success={n_success}, fail={n_fail}) |
-| Chance baseline (majority class) | {chance:.3f} |
-| Layers probed | {payload['n_layers']} (d_model={payload['d_model']}) |
-| Early->late delta (mean over layers) | {c['delta']:+.3f} |
-| Layers showing the increase | {c['increasing_layers']}/{payload['n_layers']} |
-| Best late-bin probe | {best_str} |
+| Trajectories (mixed tasks) | {n} (success={n_success}, fail={n_fail}) |
+| Best within-task micro-AUC | {best_wt if best_wt is not None else 'n/a'} (layer {best_layer_within}) |
+| Best LOTO AUC | {best_loto if best_loto is not None else 'n/a'} |
+| Early→late within-task delta | {c['wt_delta']:+.3f} (supplementary only) |
 | **Decision band** | **{band_label}** |
 
-## Accuracy by relative position (mean over layers)
+## Validation conditions
 
-| Relative position | Acc (mean over layers) | Spread across layers | AUC (OOF) | n (pos/neg) |
-|---|---|---|---|---|
+| Condition | Result |
+|---|---|
+{cond_rows}
+
+## Within-task and LOTO AUC by relative position
+
+| Relative position | Within-task micro-AUC | LOTO AUC |
+|---|---|---|
 {chr(10).join(bin_rows)}
 
-Chance baseline = {chance:.3f}. "Spread across layers" is the std of the per-layer
-accuracies; the per-cell cross-validation fold spread is in `probe_results.json`
-(`acc_std`). See `accuracy_by_position.png`, `accuracy_by_layer.png`, and
-`probe_heatmap.png`.
+Chance baseline for balanced within-task classification = **0.5**. Do **not** interpret
+global accuracy or global AUC (confounded by task identity in v1 design).
 
-## Prior replay vs. this run
-
-The prior PoC replayed **foreign** SWE-bench agent transcripts through Llama
-(measuring "can Llama decode another agent's outcome?"). This migration runs
-**Llama as the agent** in a lightweight coding sandbox when `source=live_sandbox`.
-
-{comparison_rows}
-
-**Interpretation.** {interpretation}
-
-## Class balance
-
-{n_success} successes / {n_fail} failures out of {n} trajectories.{imbalance_note}
+See `within_task_heatmap.png`, `loto_heatmap.png`, `within_task_by_position.png`.
 
 ## Recommendation
 
 {c['action']}
 {skepticism_block}
-## Methodological caveats (read before trusting the numbers)
+## Methodological notes (v2)
 
-1. **Small N / cross-validation noise.** With ~{n} trajectories, CV folds hold
-   only a handful of examples each, so accuracy is noisy. We report the spread
-   across folds (`acc_std`) and across layers, not just the mean - do not over-read
-   any single accuracy number.
-2. **High dimensions vs. few samples.** The residual stream is {payload['d_model']}-dim
-   but N ~ {n}, so the probe is heavily regularized (StandardScaler + L2,
-   C={payload['probe_C']}). Absolute accuracy is regularization-sensitive; the
-   *shape* of the early->late trend matters more than the absolute level.
-3. **Relative-position binning.** Steps are bucketed into early/mid/late thirds of
-   each trajectory (not absolute step index) so that short and long trajectories
-   both contribute to every bin, removing the "fewer examples at late steps"
-   confound. Each trajectory contributes one mean-pooled row per bin.
-4. **PoC scope.** No causal validation, no SAE features, single domain
-   ({domain_label}), logistic-regression probes only. This is a
-   direction-validation PoC, not a publication-grade measurement.
-
-{domain_caveats}
+1. **Multi-seed per task.** Each task has K trajectories (different seeds / sampling).
+   Labels vary within task so probes cannot shortcut via task identity alone.
+2. **Mixed-task filter.** Tasks with only successes or only failures are dropped.
+3. **Primary metrics:** within-task micro-AUC and LOTO AUC. Global stratified CV is
+   deprecated (`metric_tier: deprecated_confounded`).
+4. **PoC scope.** Logistic probes on residual stream; correlational not causal.
 
 ## Reproduce
 
-{reproduce}
+```bash
+python run_pipeline.py
+VERITAS_SMOKE_N=2 python run_pipeline.py   # smoke: 2 tasks x 3 seeds
+python -m analysis.run_scorer              # score an existing run
+```
+
+See also `results/run_score.md` for INVALID / INCONCLUSIVE / MEANINGFUL verdict.
 """
     OUT_PATH.write_text(md, encoding="utf-8")
     print(f"Wrote {OUT_PATH}", flush=True)
-    print(f"Decision band: {band_label}  "
-          f"(delta={c['delta']:+.3f}, increasing_layers={c['increasing_layers']})",
-          flush=True)
+    print(f"Decision band: {band_label}  (within={best_wt}, loto={best_loto})", flush=True)
 
 
 if __name__ == "__main__":

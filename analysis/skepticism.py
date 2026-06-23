@@ -1,13 +1,13 @@
-"""Skepticism checks on probe results (run after analysis/probe.py).
+"""Skepticism checks on probe results (v2 — within-task focused).
 
 Validates whether above-chance decodability survives controls that rule out
-common confounds:
+task-identity memorization:
 
-  1. Global label permutation null (luck on N trajectories)
-  2. Within-instance label shuffle (task-ID / instance memorization)
-  3. Instance holdout CV (generalize to unseen SWE-bench tasks)
-  4. Early-text TF-IDF baseline vs activation probe (issue-text-only signal)
-  5. Bootstrap CIs on trajectory resampling (early bin, reference layer)
+  1. Within-task label shuffle (PRIMARY leakage test)
+  2. Within-task activation probe vs text baseline
+  3. LOTO (leave-one-task-out) generalization
+  4. Per-task permutation null
+  5. Bootstrap CIs on trajectory resampling (unique traj IDs)
 
 Run:  python -m analysis.skepticism
 """
@@ -19,17 +19,18 @@ from collections import defaultdict
 
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.model_selection import LeaveOneGroupOut, StratifiedKFold
 
 from analysis.probe import (
     BIN_NAMES,
     PROBE_C,
     RANDOM_STATE,
     build_dataset,
+    loto_cv,
     probe_one,
     relative_bin,
+    within_task_cv,
 )
-from interp.activation_cache import RESULTS_DIR, load_activations
+from interp.activation_cache import RESULTS_DIR
 
 TRAJ_PATH = RESULTS_DIR / "trajectories.json"
 PROBE_PATH = RESULTS_DIR / "probe_results.json"
@@ -48,7 +49,6 @@ _STRIP_PATTERNS = [
 
 
 def _strip_instance_cues(text: str, traj: dict) -> str:
-    """Remove task ids and filenames so text baseline is less instance-memorization."""
     out = text
     inst = str(traj.get("instance_id", ""))
     if inst:
@@ -59,7 +59,6 @@ def _strip_instance_cues(text: str, traj: dict) -> str:
 
 
 def _early_text(traj: dict) -> str:
-    """Concatenate ai step previews that fall in the early relative bin."""
     texts = traj.get("step_texts") or []
     total = len(traj.get("step_positions") or texts)
     if total == 0:
@@ -71,52 +70,43 @@ def _early_text(traj: dict) -> str:
     return " ".join(parts)
 
 
-def build_indexed_rows(trajectories: list[dict]) -> tuple[dict, int, int]:
-    """Per-bin rows aligned across trajectories for skepticism checks.
-
-    Returns:
-      rows: dict[bin] -> list of {traj_id, instance_id, success, early_text}
-      features, labels, n_layers, d_model from build_dataset (same row order)
-    """
-    features, labels, n_layers, d_model = build_dataset(trajectories)
+def build_indexed_rows(trajectories: list[dict]) -> tuple[dict, dict, dict, dict, int, int]:
+    features, labels, meta, n_layers, d_model = build_dataset(trajectories)
+    traj_by_id = {t["id"]: t for t in trajectories}
     rows: dict[int, list[dict]] = {b: [] for b in range(len(BIN_NAMES))}
 
-    for traj in trajectories:
-        try:
-            load_activations(traj["id"])
-        except FileNotFoundError:
-            continue
-        total = len(traj["step_positions"])
-        meta = {
-            "traj_id": traj["id"],
-            "instance_id": str(traj.get("instance_id", traj["id"])),
-            "success": int(bool(traj["success"])),
-            "early_text": _early_text(traj),
-            "early_text_stripped": _strip_instance_cues(_early_text(traj), traj),
-        }
-        seen_bins = set()
-        for s in range(total):
-            seen_bins.add(relative_bin(s, total))
-        for b in sorted(seen_bins):
-            rows[b].append(meta)
+    for b in range(len(BIN_NAMES)):
+        for m in meta[b]:
+            traj = traj_by_id.get(m["traj_id"], {})
+            early = _early_text(traj) if traj else ""
+            rows[b].append({
+                "traj_id": m["traj_id"],
+                "instance_id": m["instance_id"],
+                "success": int(bool(traj.get("success"))) if traj else 0,
+                "early_text": early,
+                "early_text_stripped": _strip_instance_cues(early, traj) if traj else "",
+            })
 
-    return rows, features, labels, n_layers, d_model
+    return rows, features, labels, meta, n_layers, d_model
 
 
-def best_layer_early(probe_payload: dict | None, features, labels, n_layers: int) -> int:
-    """Layer with highest early-bin CV accuracy in saved probe results, else argmax here."""
+def best_layer_early(probe_payload: dict | None, features, labels, meta, n_layers: int) -> int:
     if probe_payload:
-        early = [r for r in probe_payload["results"]
-                 if r["bin_idx"] == EARLY_BIN and r["acc_mean"] is not None]
+        early = [
+            r for r in probe_payload["results"]
+            if r["bin_idx"] == EARLY_BIN and r.get("within_task_micro_auc") is not None
+        ]
         if early:
-            return int(max(early, key=lambda r: r["acc_mean"])["layer"])
-    best_l, best_acc = 0, -1.0
+            return int(max(early, key=lambda r: r["within_task_micro_auc"])["layer"])
+    best_l, best_auc = 0, -1.0
+    groups = np.array([m["instance_id"] for m in meta[EARLY_BIN]])
     for layer in range(n_layers):
         X = np.array(features[(layer, EARLY_BIN)], dtype=np.float64)
         y = np.array(labels[EARLY_BIN], dtype=int)
-        cell = probe_one(X, y)
-        if cell["acc_mean"] is not None and cell["acc_mean"] > best_acc:
-            best_acc = cell["acc_mean"]
+        cell = within_task_cv(X, y, groups)
+        auc = cell.get("micro_auc")
+        if auc is not None and auc > best_auc:
+            best_auc = auc
             best_l = layer
     return best_l
 
@@ -130,43 +120,37 @@ def shuffle_within_instance(y: np.ndarray, groups: np.ndarray, rng: np.random.Ge
     return y2
 
 
-def permutation_null_auc(X: np.ndarray, y: np.ndarray, n_perm: int, rng: np.random.Generator) -> dict:
-    """Null distribution of AUC under global label shuffles."""
-    real = probe_one(X, y)
-    real_auc = real.get("auc")
+def within_task_permutation_null(
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    n_perm: int,
+    rng: np.random.Generator,
+) -> dict:
+    """Null distribution of within-task AUC under per-task label shuffles."""
+    real = within_task_cv(X, y, groups)
+    real_auc = real.get("micro_auc")
     if real_auc is None:
         return {"real_auc": None, "null_mean": None, "p_value": None, "note": real.get("note", "")}
 
     null_aucs = []
     for _ in range(n_perm):
-        y_perm = rng.permutation(y)
-        cell = probe_one(X, y_perm)
-        if cell.get("auc") is not None:
-            null_aucs.append(cell["auc"])
-    null_aucs = np.array(null_aucs)
-    p = float((null_aucs >= real_auc).mean()) if len(null_aucs) else None
+        y_perm = shuffle_within_instance(y, groups, rng)
+        cell = within_task_cv(X, y_perm, groups)
+        if cell.get("micro_auc") is not None:
+            null_aucs.append(cell["micro_auc"])
+    null_aucs_arr = np.array(null_aucs)
+    p = float((null_aucs_arr >= real_auc).mean()) if len(null_aucs_arr) else None
     return {
         "real_auc": float(real_auc),
-        "null_mean": float(null_aucs.mean()) if len(null_aucs) else None,
-        "null_std": float(null_aucs.std()) if len(null_aucs) else None,
+        "null_mean": float(null_aucs_arr.mean()) if len(null_aucs_arr) else None,
+        "null_std": float(null_aucs_arr.std()) if len(null_aucs_arr) else None,
         "p_value": p,
-        "n_perm": len(null_aucs),
+        "n_perm": len(null_aucs_arr),
     }
 
 
-def instance_holdout(X: np.ndarray, y: np.ndarray, groups: np.ndarray) -> dict:
-    """Leave-one-task-out CV: test on trajectories from unseen tasks."""
-    n_groups = len(np.unique(groups))
-    if n_groups < 2:
-        return {"note": "need >= 2 instances for instance holdout", "acc_mean": None, "auc": None}
-    try:
-        return probe_one(X, y, cv=LeaveOneGroupOut(), groups=groups)
-    except Exception as exc:  # pragma: no cover - e.g. single-class fold
-        return {"note": f"instance holdout failed: {exc}", "acc_mean": None, "auc": None}
-
-
-def text_baseline_early(texts: list[str], y: np.ndarray) -> dict:
-    """TF-IDF on early-bin step text only (no activations)."""
+def text_baseline_within_task(texts: list[str], y: np.ndarray, groups: np.ndarray) -> dict:
     if len(texts) != len(y) or len(y) < 4:
         return {"note": "insufficient rows for text baseline"}
     vec = TfidfVectorizer(max_features=MAX_TFIDF_FEATURES, stop_words="english")
@@ -174,150 +158,174 @@ def text_baseline_early(texts: list[str], y: np.ndarray) -> dict:
         X = vec.fit_transform(texts).toarray()
     except ValueError as exc:
         return {"note": f"tfidf failed: {exc}"}
-    return probe_one(X, y)
+    wt = within_task_cv(X, y, groups)
+    loto = loto_cv(X, y, groups)
+    return {
+        "within_task_micro_auc": wt.get("micro_auc"),
+        "within_task_macro_auc": wt.get("macro_auc"),
+        "loto_auc": loto.get("auc"),
+        "note": wt.get("note", ""),
+    }
 
 
-def bootstrap_auc_ci(
+def bootstrap_within_task_ci(
     X: np.ndarray,
     y: np.ndarray,
+    groups: np.ndarray,
+    traj_ids: list[str],
     n_boot: int,
     rng: np.random.Generator,
     ci: float = 0.95,
 ) -> dict:
-    """Bootstrap trajectories (rows) with replacement; distribution of OOF AUC."""
+    """Bootstrap unique trajectory IDs, then within-task AUC."""
     n = len(y)
     if n < 4:
         return {"note": "too few rows for bootstrap"}
+    unique_ids = list(dict.fromkeys(traj_ids))
     aucs = []
     for _ in range(n_boot):
-        idx = rng.integers(0, n, size=n)
-        # Need both classes in resample
-        if len(np.unique(y[idx])) < 2:
+        sampled = rng.choice(unique_ids, size=len(unique_ids), replace=True)
+        idx = [i for i, tid in enumerate(traj_ids) if tid in set(sampled)]
+        # Include all rows for sampled trajectory IDs (with replacement weight)
+        idx = []
+        for tid in sampled:
+            idx.extend([i for i, t in enumerate(traj_ids) if t == tid])
+        if len(idx) < 4:
             continue
-        cell = probe_one(X[idx], y[idx])
-        if cell.get("auc") is not None:
-            aucs.append(cell["auc"])
+        idx_arr = np.array(idx)
+        if len(np.unique(y[idx_arr])) < 2:
+            continue
+        cell = within_task_cv(X[idx_arr], y[idx_arr], groups[idx_arr])
+        if cell.get("micro_auc") is not None:
+            aucs.append(cell["micro_auc"])
     if not aucs:
         return {"note": "no valid bootstrap samples"}
-    aucs = np.array(aucs)
-    lo = float(np.percentile(aucs, (1 - ci) / 2 * 100))
-    hi = float(np.percentile(aucs, (1 + ci) / 2 * 100))
+    aucs_arr = np.array(aucs)
+    lo = float(np.percentile(aucs_arr, (1 - ci) / 2 * 100))
+    hi = float(np.percentile(aucs_arr, (1 + ci) / 2 * 100))
     return {
-        "auc_mean": float(aucs.mean()),
-        "auc_std": float(aucs.std()),
+        "auc_mean": float(aucs_arr.mean()),
+        "auc_std": float(aucs_arr.std()),
         "ci_low": lo,
         "ci_high": hi,
-        "n_boot_effective": int(len(aucs)),
+        "n_boot_effective": int(len(aucs_arr)),
     }
 
 
 def _verdict(checks: dict) -> str:
-    """Short human verdict from the control battery."""
     flags = []
-    perm = checks.get("global_permutation", {})
-    if perm.get("p_value") is not None and perm["p_value"] > 0.05:
-        flags.append("global permutation not significant (p>0.05)")
-    inst = checks.get("within_instance_shuffle", {})
-    drop = inst.get("auc_drop")
-    if drop is not None and drop < 0.05:
-        flags.append(
-            "within-instance label shuffle barely hurts AUC (task/instance cues may dominate)"
-        )
-    hold = checks.get("instance_holdout", {})
-    if hold.get("auc") is not None and hold["auc"] < 0.55:
-        flags.append("instance holdout AUC weak (<0.55)")
-    text = checks.get("text_baseline_early", {})
-    text_stripped = checks.get("text_baseline_stripped", {})
-    act = checks.get("activation_early", {})
-    if text.get("auc") is not None and act.get("auc") is not None:
-        if text["auc"] >= act["auc"] - 0.03:
-            flags.append("early text alone nearly matches activations")
-        elif act["auc"] - text["auc"] >= 0.08:
-            flags.append("activations beat text baseline (internal signal beyond issue text)")
-    if text_stripped.get("auc") is not None and act.get("auc") is not None:
-        if act["auc"] - text_stripped["auc"] >= 0.05:
-            flags.append("activations beat stripped-text baseline (beyond task-id wording)")
-        elif text_stripped["auc"] >= act["auc"] - 0.03:
-            flags.append("stripped early text still matches activations")
+    wt = checks.get("activation_within_task", {})
+    loto = checks.get("loto", {})
+    perm = checks.get("within_task_permutation", {})
+    shuffle = checks.get("within_instance_shuffle", {})
+    text = checks.get("text_baseline_within_task", {})
 
-    if not flags:
-        return (
-            "Controls look favorable: signal survives instance holdout and/or beats "
-            "text baseline; permutation p-value supports above-chance decoding."
+    wt_auc = wt.get("micro_auc")
+    loto_auc = loto.get("auc")
+
+    if wt_auc is not None and wt_auc < 0.55:
+        flags.append("within-task AUC weak (<0.55)")
+    if loto_auc is not None and loto_auc < 0.55:
+        flags.append("LOTO AUC weak (<0.55)")
+
+    drop = shuffle.get("auc_drop")
+    if drop is not None and drop < 0.15:
+        flags.append(
+            "within-task label shuffle barely hurts AUC (task-identity leakage likely)"
         )
+
+    if perm.get("p_value") is not None and perm["p_value"] > 0.05:
+        flags.append("within-task permutation not significant (p>0.05)")
+
+    text_auc = text.get("within_task_micro_auc")
+    if text_auc is not None and wt_auc is not None:
+        if text_auc >= wt_auc - 0.03:
+            flags.append("early text alone nearly matches activations (within-task)")
+        elif wt_auc - text_auc >= 0.05:
+            flags.append("activations beat text baseline within-task")
+
+    if not flags and wt_auc is not None and wt_auc > 0.55:
+        return (
+            "v2 controls favorable: within-task AUC above chance, LOTO generalizes, "
+            "per-task shuffle collapses or permutation significant."
+        )
+    if not flags:
+        return "Mixed results — inspect per-task AUC distribution and ablations."
     return "Caveats: " + "; ".join(flags) + "."
 
 
 def render_markdown(report: dict) -> str:
     c = report["checks"]
     lines = [
-        "# Skepticism checks (auto-generated)",
+        "# Skepticism checks v2 (auto-generated)",
         "",
         f"Reference: early bin, layer {report['reference_layer']}, "
         f"n={report['n_trajectories']} trajectories, "
-        f"{report['n_instances']} distinct tasks.",
+        f"{report['n_instances']} distinct tasks, "
+        f"{report['n_mixed_tasks']} with mixed labels.",
         "",
         "## Results",
         "",
         "| Check | Metric | Value |",
         "|---|---|---|",
     ]
-    act = c["activation_early"]
+    act = c["activation_within_task"]
     lines.append(
-        f"| Activation probe (early) | AUC | {act.get('auc', 'n/a')} "
-        f"(acc {act.get('acc_mean', 'n/a')}) |"
+        f"| Activation probe (within-task) | micro-AUC | {act.get('micro_auc', 'n/a')} "
+        f"(macro {act.get('macro_auc', 'n/a')}) |"
     )
-    txt = c["text_baseline_early"]
+    loto = c["loto"]
     lines.append(
-        f"| Early text TF-IDF only | AUC | {txt.get('auc', 'n/a')} "
-        f"(acc {txt.get('acc_mean', 'n/a')}) |"
+        f"| LOTO (leave-one-task-out) | AUC | {loto.get('auc', 'n/a')} |"
+    )
+    txt = c["text_baseline_within_task"]
+    lines.append(
+        f"| Early text TF-IDF (within-task) | micro-AUC | "
+        f"{txt.get('within_task_micro_auc', 'n/a')} |"
     )
     txt_s = c.get("text_baseline_stripped", {})
     lines.append(
-        f"| Early text TF-IDF (stripped) | AUC | {txt_s.get('auc', 'n/a')} "
-        f"(acc {txt_s.get('acc_mean', 'n/a')}) |"
+        f"| Early text TF-IDF stripped (within-task) | micro-AUC | "
+        f"{txt_s.get('within_task_micro_auc', 'n/a')} |"
     )
-    perm = c["global_permutation"]
+    perm = c["within_task_permutation"]
     lines.append(
-        f"| Global label shuffle null | p-value | {perm.get('p_value', 'n/a')} "
-        f"(null AUC mean {perm.get('null_mean', 'n/a')}) |"
+        f"| Within-task label shuffle null | p-value | {perm.get('p_value', 'n/a')} "
+        f"(null mean {perm.get('null_mean', 'n/a')}) |"
     )
     wis = c["within_instance_shuffle"]
     drop_s = f"{wis['auc_drop']:+.3f}" if wis.get("auc_drop") is not None else "n/a"
     lines.append(
-        f"| Within-instance label shuffle | AUC | {wis.get('shuffled_auc', 'n/a')} "
-        f"(drop {drop_s} vs real) |"
+        f"| Within-task shuffle (single) | AUC | {wis.get('shuffled_auc', 'n/a')} "
+        f"(drop {drop_s}) |"
     )
-    hold = c["instance_holdout"]
-    lines.append(
-        f"| Task holdout (LOIO) | AUC | {hold.get('auc', 'n/a')} "
-        f"(acc {hold.get('acc_mean', 'n/a')}) |"
-    )
-    boot = c["bootstrap_early"]
+    boot = c["bootstrap_within_task"]
     if boot.get("ci_low") is not None:
         lines.append(
-            f"| Bootstrap 95% CI (early AUC) | range | "
+            f"| Bootstrap 95% CI (within-task AUC) | range | "
             f"[{boot['ci_low']:.3f}, {boot['ci_high']:.3f}] |"
         )
+    global_dep = c.get("global_permutation_deprecated", {})
+    lines.append(
+        f"| Global shuffle (deprecated) | p-value | "
+        f"{global_dep.get('p_value', 'n/a')} — confounded, do not interpret |"
+    )
     lines.extend([
         "",
         "## Verdict",
         "",
         report["verdict"],
         "",
-        "## How to read",
+        "## How to read (v2)",
         "",
-        "- **Global permutation p-value**: fraction of shuffled-label runs with AUC "
-        "≥ real. Low p → unlikely to be luck on N alone.",
-        "- **Within-task shuffle**: permutes success/fail labels among attempts "
-        "at the *same* task. Large AUC drop → signal used task-specific "
-        "structure; small drop → more about per-attempt dynamics. "
-        "N/A when max_per_instance=1 (one attempt per task).",
-        "- **Task holdout (LOIO)**: train on N-1 tasks, test on the held-out task. "
-        "Strong AUC → generalizes across tasks.",
-        "- **Text baseline**: early `ai` step text only. Stripped variant removes "
-        "task ids and filenames. If activation AUC ≫ stripped text, internal "
-        "state adds signal beyond surface wording.",
+        "- **Within-task AUC (PRIMARY)**: predicts success vs failure among trajectories "
+        "of the *same* task. Must be > 0.5 for latent forecasting signal.",
+        "- **LOTO**: train on all tasks except one, test on held-out task. Kills task "
+        "memorization across tasks.",
+        "- **Within-task shuffle**: permutes labels within each task only. AUC → ~0.5 "
+        "if clean; high AUC after shuffle = leakage.",
+        "- **Text baseline (within-task)**: if activation ≈ text, signal is surface "
+        "wording not internal state.",
     ])
     return "\n".join(lines) + "\n"
 
@@ -328,66 +336,79 @@ def main() -> None:
     if PROBE_PATH.exists():
         probe_payload = json.loads(PROBE_PATH.read_text(encoding="utf-8"))
 
-    rows, features, labels, n_layers, d_model = build_indexed_rows(trajectories)
+    rows, features, labels, meta, n_layers, d_model = build_indexed_rows(trajectories)
     if n_layers is None:
         raise SystemExit("No cached activations — run Phase 1 first.")
 
-    ref_layer = best_layer_early(probe_payload, features, labels, n_layers)
+    ref_layer = best_layer_early(probe_payload, features, labels, meta, n_layers)
     X = np.array(features[(ref_layer, EARLY_BIN)], dtype=np.float64)
     y = np.array(labels[EARLY_BIN], dtype=int)
-    groups = np.array([r["instance_id"] for r in rows[EARLY_BIN]])
+    groups = np.array([m["instance_id"] for m in meta[EARLY_BIN]])
+    traj_ids = [m["traj_id"] for m in meta[EARLY_BIN]]
     texts = [r["early_text"] for r in rows[EARLY_BIN]]
     texts_stripped = [r["early_text_stripped"] for r in rows[EARLY_BIN]]
     rng = np.random.default_rng(RANDOM_STATE)
 
-    activation_early = probe_one(X, y)
-    text_early = text_baseline_early(texts, y)
-    text_stripped = text_baseline_early(texts_stripped, y)
-    global_perm = permutation_null_auc(X, y, N_PERM, rng)
+    activation_wt = within_task_cv(X, y, groups)
+    loto = loto_cv(X, y, groups)
+    text_wt = text_baseline_within_task(texts, y, groups)
+    text_stripped = text_baseline_within_task(texts_stripped, y, groups)
+    within_perm = within_task_permutation_null(X, y, groups, N_PERM, rng)
 
-    real_auc = activation_early.get("auc")
+    real_auc = activation_wt.get("micro_auc")
     y_inst = shuffle_within_instance(y, groups, rng)
-    shuffled_cell = probe_one(X, y_inst)
-    shuffled_auc = shuffled_cell.get("auc")
+    shuffled_wt = within_task_cv(X, y_inst, groups)
+    shuffled_auc = shuffled_wt.get("micro_auc")
     auc_drop = (real_auc - shuffled_auc) if (real_auc is not None and shuffled_auc is not None) else None
 
-    holdout = instance_holdout(X, y, groups)
-    bootstrap = bootstrap_auc_ci(X, y, N_BOOT, rng)
+    bootstrap = bootstrap_within_task_ci(X, y, groups, traj_ids, N_BOOT, rng)
 
-    # Per-instance label diversity (how many instances have both classes?)
+    # Deprecated global check for comparison only
+    from analysis.probe import probe_one as global_probe
+    global_perm_real = global_probe(X, y)
+    global_perm_aucs = []
+    for _ in range(min(100, N_PERM)):
+        y_perm = rng.permutation(y)
+        cell = global_probe(X, y_perm)
+        if cell.get("auc") is not None:
+            global_perm_aucs.append(cell["auc"])
+    global_p = None
+    if global_perm_real.get("auc") is not None and global_perm_aucs:
+        global_p = float((np.array(global_perm_aucs) >= global_perm_real["auc"]).mean())
+
     by_inst: dict[str, set[int]] = defaultdict(set)
     for r in rows[EARLY_BIN]:
         by_inst[r["instance_id"]].add(r["success"])
     n_mixed = sum(1 for s in by_inst.values() if len(s) > 1)
-    within_note = (
-        f"shuffle only permutes within tasks that have >= 2 attempts; "
-        f"{n_mixed}/{len(by_inst)} tasks have both success and fail."
-    )
-    if n_mixed == 0:
-        within_note += " With one attempt per task, within-task shuffle is a no-op."
 
     checks = {
-        "activation_early": activation_early,
-        "text_baseline_early": text_early,
+        "activation_within_task": activation_wt,
+        "loto": loto,
+        "text_baseline_within_task": text_wt,
         "text_baseline_stripped": text_stripped,
-        "global_permutation": global_perm,
+        "within_task_permutation": within_perm,
         "within_instance_shuffle": {
             "real_auc": real_auc,
             "shuffled_auc": shuffled_auc,
             "auc_drop": auc_drop,
             "n_instances": len(by_inst),
             "n_instances_with_both_labels": n_mixed,
-            "note": within_note,
         },
-        "instance_holdout": holdout,
-        "bootstrap_early": bootstrap,
+        "bootstrap_within_task": bootstrap,
+        "global_permutation_deprecated": {
+            "real_auc": global_perm_real.get("auc"),
+            "p_value": global_p,
+            "note": "deprecated confounded metric — do not interpret",
+        },
     }
 
     report = {
+        "version": "v2",
         "reference_layer": ref_layer,
         "reference_bin": BIN_NAMES[EARLY_BIN],
         "n_trajectories": len(trajectories),
         "n_instances": len(by_inst),
+        "n_mixed_tasks": n_mixed,
         "d_model": d_model,
         "probe_C": PROBE_C,
         "checks": checks,
@@ -396,13 +417,12 @@ def main() -> None:
     OUT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
     OUT_MD.write_text(render_markdown(report), encoding="utf-8")
 
-    print(f"Skepticism checks (early bin, layer {ref_layer})", flush=True)
-    print(f"  activation AUC: {activation_early.get('auc')}", flush=True)
-    print(f"  text baseline AUC: {text_early.get('auc')}", flush=True)
-    print(f"  stripped text AUC: {text_stripped.get('auc')}", flush=True)
-    print(f"  permutation p-value: {global_perm.get('p_value')}", flush=True)
-    print(f"  within-instance shuffled AUC: {shuffled_auc} (drop {auc_drop})", flush=True)
-    print(f"  instance holdout AUC: {holdout.get('auc')}", flush=True)
+    print(f"Skepticism checks v2 (early bin, layer {ref_layer})", flush=True)
+    print(f"  within-task micro-AUC: {activation_wt.get('micro_auc')}", flush=True)
+    print(f"  LOTO AUC: {loto.get('auc')}", flush=True)
+    print(f"  text baseline within-task AUC: {text_wt.get('within_task_micro_auc')}", flush=True)
+    print(f"  within-task permutation p-value: {within_perm.get('p_value')}", flush=True)
+    print(f"  within-task shuffled AUC: {shuffled_auc} (drop {auc_drop})", flush=True)
     if bootstrap.get("ci_low") is not None:
         print(f"  bootstrap 95% CI: [{bootstrap['ci_low']:.3f}, {bootstrap['ci_high']:.3f}]",
               flush=True)

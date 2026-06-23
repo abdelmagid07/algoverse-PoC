@@ -194,5 +194,180 @@
     "starter_code": "def second_index(xs):\n    return xs[2]\n",
     "test_code": "from solution import second_index\nassert second_index([10, 20, 30]) == 20\nassert second_index(['a', 'b']) == 'b'\n",
     "difficulty": "easy"
+  },
+  {
+    "id": "fix_sub_029",
+    "problem": "subtract should return a minus b. It adds instead.",
+    "starter_code": "def subtract(a, b):\n    return a + b\n",
+    "test_code": "from solution import subtract\nassert subtract(10, 3) == 7\nassert subtract(5, 5) == 0\nassert subtract(2, 7) == -5\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_mod_030",
+    "problem": "modulo should return a % b. It returns integer division.",
+    "starter_code": "def modulo(a, b):\n    return a // b\n",
+    "test_code": "from solution import modulo\nassert modulo(10, 3) == 1\nassert modulo(8, 4) == 0\nassert modulo(7, 2) == 1\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_power_031",
+    "problem": "power should return base raised to exp. It multiplies base by exp.",
+    "starter_code": "def power(base, exp):\n    return base * exp\n",
+    "test_code": "from solution import power\nassert power(2, 3) == 8\nassert power(5, 0) == 1\nassert power(3, 2) == 9\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_is_odd_032",
+    "problem": "is_odd should return True when n is not divisible by 2. Even numbers return True.",
+    "starter_code": "def is_odd(n):\n    return n % 2 == 0\n",
+    "test_code": "from solution import is_odd\nassert is_odd(3) is True\nassert is_odd(4) is False\nassert is_odd(1) is True\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_concat_033",
+    "problem": "concat should join two strings. It returns only the first.",
+    "starter_code": "def concat(a, b):\n    return a\n",
+    "test_code": "from solution import concat\nassert concat('ab', 'cd') == 'abcd'\nassert concat('', 'x') == 'x'\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_trim_034",
+    "problem": "trim_spaces should remove leading and trailing whitespace. Only leading is trimmed.",
+    "starter_code": "def trim_spaces(s):\n    return s.lstrip()\n",
+    "test_code": "from solution import trim_spaces\nassert trim_spaces('  hi  ') == 'hi'\nassert trim_spaces('x') == 'x'\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_head_035",
+    "problem": "head should return the first n elements of a list. It returns one too many.",
+    "starter_code": "def head(xs, n):\n    return xs[:n + 1]\n",
+    "test_code": "from solution import head\nassert head([1, 2, 3, 4], 2) == [1, 2]\nassert head(['a'], 1) == ['a']\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_tail_036",
+    "problem": "tail should return all but the first element. It drops the last instead.",
+    "starter_code": "def tail(xs):\n    return xs[:-1]\n",
+    "test_code": "from solution import tail\nassert tail([1, 2, 3]) == [2, 3]\nassert tail([5]) == []\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_any_neg_037",
+    "problem": "any_negative should return True if any number is below zero. Positive zero is mishandled.",
+    "starter_code": "def any_negative(xs):\n    for x in xs:\n        if x <= 0:\n            return True\n    return False\n",
+    "test_code": "from solution import any_negative\nassert any_negative([1, -2, 3]) is True\nassert any_negative([1, 2]) is False\nassert any_negative([0]) is False\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_max_list_038",
+    "problem": "max_list should return the largest value in a non-empty list. It returns the smallest.",
+    "starter_code": "def max_list(xs):\n    best = xs[0]\n    for x in xs:\n        if x < best:\n            best = x\n    return best\n",
+    "test_code": "from solution import max_list\nassert max_list([3, 1, 4]) == 4\nassert max_list([-1, -5]) == -1\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_min_list_039",
+    "problem": "min_list should return the smallest value in a non-empty list. It returns the largest.",
+    "starter_code": "def min_list(xs):\n    best = xs[0]\n    for x in xs:\n        if x > best:\n            best = x\n    return best\n",
+    "test_code": "from solution import min_list\nassert min_list([3, 1, 4]) == 1\nassert min_list([5, 5]) == 5\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_count_char_040",
+    "problem": "count_char should count occurrences of ch in s. It always returns 1.",
+    "starter_code": "def count_char(s, ch):\n    return 1\n",
+    "test_code": "from solution import count_char\nassert count_char('banana', 'a') == 3\nassert count_char('xyz', 'z') == 1\nassert count_char('', 'a') == 0\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_replace_041",
+    "problem": "replace_all should replace every old substring with new. Only first is replaced.",
+    "starter_code": "def replace_all(s, old, new):\n    return s.replace(old, new, 1)\n",
+    "test_code": "from solution import replace_all\nassert replace_all('aaa', 'a', 'b') == 'bbb'\nassert replace_all('aba', 'a', 'x') == 'xbx'\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_starts_042",
+    "problem": "starts_with should return True when s begins with prefix. Empty prefix is wrong.",
+    "starter_code": "def starts_with(s, prefix):\n    if not prefix:\n        return False\n    return s.startswith(prefix)\n",
+    "test_code": "from solution import starts_with\nassert starts_with('hello', 'he') is True\nassert starts_with('hello', 'lo') is False\nassert starts_with('x', '') is True\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_ends_043",
+    "problem": "ends_with should return True when s ends with suffix. Comparison uses wrong slice.",
+    "starter_code": "def ends_with(s, suffix):\n    return s[:len(suffix)] == suffix\n",
+    "test_code": "from solution import ends_with\nassert ends_with('hello', 'lo') is True\nassert ends_with('hello', 'he') is False\nassert ends_with('a', '') is True\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_flatten_044",
+    "problem": "flatten_one should flatten one level of nested lists. It returns the outer list unchanged.",
+    "starter_code": "def flatten_one(nested):\n    return nested\n",
+    "test_code": "from solution import flatten_one\nassert flatten_one([[1], [2, 3]]) == [1, 2, 3]\nassert flatten_one([[], [4]]) == [4]\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_zip_max_045",
+    "problem": "zip_max should take the max of each pair from two equal lists. It takes the min.",
+    "starter_code": "def zip_max(a, b):\n    return [min(x, y) for x, y in zip(a, b)]\n",
+    "test_code": "from solution import zip_max\nassert zip_max([1, 5], [3, 2]) == [3, 5]\nassert zip_max([], []) == []\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_cumsum_046",
+    "problem": "cumsum should return running totals. The first element is omitted.",
+    "starter_code": "def cumsum(xs):\n    out = []\n    total = 0\n    for x in xs:\n        total += x\n        out.append(total)\n    return out[1:]\n",
+    "test_code": "from solution import cumsum\nassert cumsum([1, 2, 3]) == [1, 3, 6]\nassert cumsum([5]) == [5]\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_drop_dup_047",
+    "problem": "drop_duplicates should remove duplicate values preserving order. It keeps all.",
+    "starter_code": "def drop_duplicates(xs):\n    return xs\n",
+    "test_code": "from solution import drop_duplicates\nassert drop_duplicates([1, 2, 1, 3]) == [1, 2, 3]\nassert drop_duplicates([]) == []\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_rotate_048",
+    "problem": "rotate_left should move the first element to the end. It rotates right instead.",
+    "starter_code": "def rotate_left(xs):\n    if not xs:\n        return xs\n    return [xs[-1]] + xs[:-1]\n",
+    "test_code": "from solution import rotate_left\nassert rotate_left([1, 2, 3]) == [2, 3, 1]\nassert rotate_left([7]) == [7]\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_merge_049",
+    "problem": "merge_sorted should merge two sorted lists into one sorted list. Order is wrong.",
+    "starter_code": "def merge_sorted(a, b):\n    return sorted(a) + sorted(b)\n",
+    "test_code": "from solution import merge_sorted\nassert merge_sorted([1, 3], [2, 4]) == [1, 2, 3, 4]\nassert merge_sorted([], [1]) == [1]\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_gcd_050",
+    "problem": "gcd should return the greatest common divisor. It returns the smaller input always.",
+    "starter_code": "def gcd(a, b):\n    return min(abs(a), abs(b))\n",
+    "test_code": "from solution import gcd\nassert gcd(12, 8) == 4\nassert gcd(7, 3) == 1\nassert gcd(0, 5) == 5\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_fizz_051",
+    "problem": "fizzbuzz_val should return 'fizz' for multiples of 3, 'buzz' for 5, 'fizzbuzz' for both, else str(n). Logic is swapped.",
+    "starter_code": "def fizzbuzz_val(n):\n    if n % 3 == 0 and n % 5 == 0:\n        return str(n)\n    if n % 3 == 0:\n        return 'buzz'\n    if n % 5 == 0:\n        return 'fizz'\n    return str(n)\n",
+    "test_code": "from solution import fizzbuzz_val\nassert fizzbuzz_val(3) == 'fizz'\nassert fizzbuzz_val(5) == 'buzz'\nassert fizzbuzz_val(15) == 'fizzbuzz'\nassert fizzbuzz_val(2) == '2'\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_vowel_052",
+    "problem": "count_vowels should count a,e,i,o,u in lowercase s. Consonants are counted.",
+    "starter_code": "def count_vowels(s):\n    vowels = 'aeiou'\n    return sum(1 for c in s if c not in vowels)\n",
+    "test_code": "from solution import count_vowels\nassert count_vowels('hello') == 2\nassert count_vowels('xyz') == 0\nassert count_vowels('aei') == 3\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_title_053",
+    "problem": "title_case should capitalize the first letter of each word and lower the rest. Only first char of string is changed.",
+    "starter_code": "def title_case(s):\n    if not s:\n        return s\n    return s[0].upper() + s[1:]\n",
+    "test_code": "from solution import title_case\nassert title_case('hello world') == 'Hello World'\nassert title_case('a') == 'A'\n",
+    "difficulty": "medium"
   }
 ]

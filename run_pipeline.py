@@ -1,14 +1,13 @@
 """Run the full Latent Failure Forecasting PoC pipeline in one process.
 
-Pipeline: collect live sandbox trajectories (default) or legacy SWE-bench replay
--> probe -> skepticism -> visualize -> summarize.
+Pipeline v2: collect K trajectories per task (live sandbox) -> validate ->
+probe (within-task + LOTO) -> skepticism -> visualize -> summarize.
 
-Set VERITAS_TRAJECTORY_SOURCE=replay to use foreign-trajectory replay instead of
-the live Llama sandbox agent.
+Set VERITAS_TRAJECTORY_SOURCE=replay to use legacy SWE-bench replay.
 
 Usage (Colab or local):
     python run_pipeline.py
-    VERITAS_SMOKE_N=2 python run_pipeline.py   # quick smoke (2 trajectories)
+    VERITAS_SMOKE_N=2 python run_pipeline.py   # smoke: 2 tasks x 3 seeds
 """
 from __future__ import annotations
 
@@ -22,8 +21,10 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from analysis.dataset_validate import validate_dataset  # noqa: E402
 from analysis.probe import main as probe_main  # noqa: E402
 from analysis.skepticism import main as skepticism_main  # noqa: E402
+from analysis.run_scorer import main as score_main  # noqa: E402
 from analysis.summarize import main as summarize_main  # noqa: E402
 from analysis.visualize_probe import main as visualize_main  # noqa: E402
 from interp.activation_cache import RESULTS_DIR, MODEL_NAME, load_model, log_device_choice  # noqa: E402
@@ -43,13 +44,22 @@ def _activation_exists(traj: dict) -> bool:
 
 
 def phase1_collect_live(model) -> list[dict]:
-    from agent.sandbox_runner import collect_trajectories, N_TRAJECTORIES
+    from agent.sandbox_runner import (
+        K_TRAJECTORIES_PER_TASK,
+        N_TASKS_TARGET,
+        collect_trajectories,
+    )
 
     smoke = os.environ.get("VERITAS_SMOKE_N")
     smoke_n = int(smoke) if smoke else None
-    n = smoke_n or N_TRAJECTORIES
+    n_tasks = smoke_n if smoke_n else N_TASKS_TARGET
+    k_per = 3 if smoke_n else K_TRAJECTORIES_PER_TASK
+    total_target = n_tasks * k_per
 
-    _log(f"\n=== Phase 1: live sandbox trajectories (target={n}) ===")
+    _log(
+        f"\n=== Phase 1: live sandbox v2 ({n_tasks} tasks x {k_per} seeds, "
+        f"target {total_target} trajectories) ==="
+    )
 
     done: dict[str, dict] = {}
     if TRAJ_PATH.exists():
@@ -62,24 +72,25 @@ def phase1_collect_live(model) -> list[dict]:
         except json.JSONDecodeError:
             _log("Warning: corrupt trajectories.json — starting fresh.")
 
-    if len(done) >= n:
-        trajectories = list(done.values())[:n]
-        _log(f"Phase 1 skipped: already have {len(trajectories)} trajectories.")
-        return trajectories
-
     trajectories = list(done.values())
-    need = n - len(trajectories)
-    if need > 0:
+    if len(trajectories) < total_target:
         collected = collect_trajectories(
-            model, n=n, smoke_n=smoke_n, existing=trajectories
+            model,
+            n_tasks=n_tasks,
+            k_per_task=k_per,
+            smoke_n=smoke_n,
+            existing=trajectories,
         )
-        trajectories = collected[:n]
+        trajectories = collected
         TRAJ_PATH.write_text(json.dumps(trajectories, indent=2), encoding="utf-8")
 
-    n_success = sum(t["success"] for t in trajectories[:n])
-    _log(f"\nPhase 1 done: {min(len(trajectories), n)} trajectories, "
-         f"success={n_success}")
-    return trajectories[:n]
+    n_success = sum(t["success"] for t in trajectories)
+    n_tasks_done = len({t["instance_id"] for t in trajectories})
+    _log(
+        f"\nPhase 1 done: {len(trajectories)} trajectories across "
+        f"{n_tasks_done} tasks, success={n_success}"
+    )
+    return trajectories
 
 
 def phase1_collect_replay(model) -> list[dict]:
@@ -124,8 +135,17 @@ def phase1_collect_replay(model) -> list[dict]:
     return trajectories
 
 
+def phase1_validate(trajectories: list[dict]) -> list[dict]:
+    smoke = os.environ.get("VERITAS_SMOKE_N") is not None
+    _log("\n=== Phase 1b: dataset validation (mixed-task filter) ===")
+    validated = validate_dataset(trajectories, smoke=smoke)
+    TRAJ_PATH.write_text(json.dumps(validated, indent=2), encoding="utf-8")
+    _log(f"Validated dataset: {len(validated)} trajectories written to {TRAJ_PATH}")
+    return validated
+
+
 def main() -> None:
-    _log("Latent Failure Forecasting PoC pipeline — single process, incremental checkpoints.")
+    _log("Latent Failure Forecasting PoC pipeline v2 — single process, incremental checkpoints.")
     _log(f"Trajectory source: {TRAJECTORY_SOURCE}")
     _log("Do not start another cell/script while this runs (Colab auto-sends ^C).")
 
@@ -138,19 +158,24 @@ def main() -> None:
 
     try:
         if TRAJECTORY_SOURCE == "replay":
-            phase1_collect_replay(model)
+            trajectories = phase1_collect_replay(model)
         else:
-            phase1_collect_live(model)
-        _log("\n=== Phase 2: probe (logistic regression by layer x position) ===")
+            trajectories = phase1_collect_live(model)
+        phase1_validate(trajectories)
+
+        _log("\n=== Phase 2: probe (within-task + LOTO by layer x position) ===")
         probe_main()
-        _log("\n=== Phase 2b: skepticism checks ===")
+        _log("\n=== Phase 2b: skepticism checks (v2) ===")
         skepticism_main()
         _log("\n=== Phase 3: visualize ===")
         visualize_main()
         _log("\n=== Phase 4: summary ===")
         summarize_main()
+        _log("\n=== Phase 5: run auto-scorer ===")
+        score_main()
         _log("\n=== Done ===")
         _log(f"Read: {RESULTS_DIR / 'poc_summary.md'}")
+        _log(f"Read: {RESULTS_DIR / 'run_score.md'}")
     except KeyboardInterrupt:
         _log(
             "\nInterrupted. If Phase 1 wrote checkpoints, re-run this script — "
