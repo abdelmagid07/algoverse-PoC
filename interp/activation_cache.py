@@ -226,6 +226,18 @@ def load_model(device: str | None = None, dtype: torch.dtype | None = None) -> H
     if key not in _MODEL_CACHE:
         print(f"Loading {tl_name} (n_ctx={n_ctx}, dtype={dtype}, device={device})...",
               flush=True)
+        print(
+            "Note: HuggingFace + TransformerLens stage weights in system RAM first. "
+            "Colab's GPU meter may stay at 0% for 1–3 min, then jump when weights "
+            "move to VRAM. Watch *system* RAM during this phase.",
+            flush=True,
+        )
+        if device == "cpu" and os.environ.get("COLAB_RELEASE_TAG"):
+            print(
+                "WARNING: loading on CPU inside Colab — set VERITAS_DEVICE=cuda and "
+                "confirm Runtime > T4 GPU + restart.",
+                flush=True,
+            )
         if dtype == torch.float32:
             model = HookedTransformer.from_pretrained(
                 tl_name, device=device, dtype=dtype, n_ctx=n_ctx
@@ -235,6 +247,28 @@ def load_model(device: str | None = None, dtype: torch.dtype | None = None) -> H
                 tl_name, device=device, dtype=dtype, n_ctx=n_ctx
             )
         model.eval()
+        param_dev = next(model.parameters()).device
+        print(f"Load complete — parameters on {param_dev}.", flush=True)
+        if device == "cuda":
+            if param_dev.type != "cuda":
+                raise RuntimeError(
+                    f"Requested device=cuda but model parameters are on {param_dev}. "
+                    "Restart runtime, ensure T4 GPU is enabled, set VERITAS_DEVICE=cuda."
+                )
+            print(
+                f"GPU memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB",
+                flush=True,
+            )
+        try:
+            import psutil
+
+            mem = psutil.virtual_memory()
+            print(
+                f"System RAM: {mem.used / 1e9:.1f} / {mem.total / 1e9:.1f} GB used",
+                flush=True,
+            )
+        except ImportError:
+            pass
         _MODEL_CACHE[key] = model
         free_runtime_memory()
     return _MODEL_CACHE[key]
