@@ -26,7 +26,7 @@ from agent.sandbox_env import (
     initial_user_message,
     load_tasks,
 )
-from interp.activation_cache import RESULTS_DIR, load_model
+from interp.activation_cache import RESULTS_DIR, free_runtime_memory, load_model
 
 TRAJ_PATH = RESULTS_DIR / "trajectories.json"
 
@@ -249,6 +249,7 @@ def collect_trajectories(
             f"success={done['success']} seq_len={done['seq_len']}",
             flush=True,
         )
+        free_runtime_memory()
 
     if len(trajectories) < n and smoke_n is None:
         for task in candidate_tasks:

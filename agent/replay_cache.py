@@ -67,6 +67,7 @@ def cache_step_boundary_activations(
     if ids is None:
         return None, 0, None
 
+    seq_len = len(ids)
     tokens = torch.tensor([ids], device=model.cfg.device)
     names = [f"blocks.{l}.hook_resid_post" for l in range(model.cfg.n_layers)]
     with torch.no_grad():
@@ -77,8 +78,12 @@ def cache_step_boundary_activations(
         nm: cache[nm][0].index_select(0, idx).detach().cpu().contiguous()
         for nm in names
     }
+    del cache, tokens, idx, ids
+    from interp.activation_cache import free_runtime_memory
+
     save_activations(traj_id, compact)
-    return compact, len(abs_positions), len(ids)
+    free_runtime_memory()
+    return compact, len(abs_positions), seq_len
 
 
 def finalize_trajectory_from_turns(

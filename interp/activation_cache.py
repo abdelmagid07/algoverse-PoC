@@ -128,6 +128,15 @@ RESULTS_DIR.mkdir(exist_ok=True)
 ACT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def free_runtime_memory() -> None:
+    """Best-effort release of GPU/CPU memory between trajectories."""
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def get_device() -> str:
     """Pick compute device: CUDA on Colab/big GPUs, CPU only on small local VRAM.
 
@@ -227,6 +236,7 @@ def load_model(device: str | None = None, dtype: torch.dtype | None = None) -> H
             )
         model.eval()
         _MODEL_CACHE[key] = model
+        free_runtime_memory()
     return _MODEL_CACHE[key]
 
 
