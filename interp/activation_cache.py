@@ -18,14 +18,22 @@ import torch
 from transformer_lens import HookedTransformer
 
 # --- Shared constants ------------------------------------------------------
-# Default: 8B instruct for stronger sandbox tool use. TransformerLens supports
-# Llama 3.1 8B (there is no Llama 3.2 8B — 3.2 only ships 1B/3B). Override:
-# VERITAS_MODEL=meta-llama/Llama-3.2-1B-Instruct etc. Gated: HF token + license.
-_DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+# Model picks (all supported by TransformerLens):
+#   8B: Llama 3.1 only (no 3.2 8B). Needs ~17+ GB VRAM fp16 — NOT Colab T4 (15.6 GB).
+#   3B: Llama 3.2 3B — default for T4; stronger than 1B, fits with n_ctx=8192.
+#   1B: Llama 3.2 1B — smallest fallback.
+_MODEL_8B = "meta-llama/Llama-3.1-8B-Instruct"
+_MODEL_3B = "meta-llama/Llama-3.2-3B-Instruct"
+_MODEL_1B = "meta-llama/Llama-3.2-1B-Instruct"
+# T4-safe default; set VERITAS_MODEL=meta-llama/Llama-3.1-8B-Instruct on A100/L4 (18GB+).
+_DEFAULT_MODEL = _MODEL_3B
 MODEL_NAME = os.environ.get("VERITAS_MODEL", _DEFAULT_MODEL)
 
-# Common mistake: "Llama-3.2-8B" does not exist on HF or in TransformerLens.
-_TL_8B_FALLBACK = "meta-llama/Llama-3.1-8B-Instruct"
+# Llama 3.2 has no 8B checkpoint.
+_TL_8B_FALLBACK = _MODEL_8B
+
+# 8B fp16 weights ~16.1 GB; need headroom for load + activations.
+_MIN_VRAM_8B_BYTES = 17 * 1024 ** 3
 
 
 def resolve_model_name(name: str = MODEL_NAME) -> str:
@@ -41,6 +49,43 @@ def resolve_model_name(name: str = MODEL_NAME) -> str:
     from transformer_lens.loading_from_pretrained import get_official_model_name
 
     return get_official_model_name(name)
+
+
+def _gpu_vram_bytes() -> int | None:
+    if not torch.cuda.is_available():
+        return None
+    try:
+        return int(torch.cuda.get_device_properties(0).total_memory)
+    except Exception:
+        return None
+
+
+def effective_model_name(device: str) -> str:
+    """Resolve env model id; downgrade 8B on GPUs that cannot fit fp16 weights."""
+    requested = os.environ.get("VERITAS_MODEL", _DEFAULT_MODEL)
+    tl_name = resolve_model_name(requested)
+
+    if device != "cuda" or not _is_8b_model(tl_name):
+        return tl_name
+
+    vram = _gpu_vram_bytes()
+    if vram is None or vram >= _MIN_VRAM_8B_BYTES:
+        return tl_name
+
+    if os.environ.get("VERITAS_MODEL") and _is_8b_model(tl_name):
+        raise RuntimeError(
+            f"Cannot load {tl_name} on {vram / 1e9:.1f} GB VRAM — 8B fp16 weights "
+            f"alone are ~16 GB (T4 OOMs during load). Lower n_ctx does not help.\n"
+            f"  T4/16GB: VERITAS_MODEL={_MODEL_3B}  (default) or {_MODEL_1B}\n"
+            f"  8B: Colab A100/L4 (18GB+) or VERITAS_MODEL={_MODEL_8B}"
+        )
+
+    print(
+        f"Note: {vram / 1e9:.1f} GB VRAM cannot fit 8B fp16 — using {_MODEL_3B} instead. "
+        f"Set VERITAS_MODEL explicitly for 3B/1B; use A100/L4 for 8B.",
+        flush=True,
+    )
+    return resolve_model_name(_MODEL_3B)
 
 
 def _is_8b_model(name: str = MODEL_NAME) -> bool:
@@ -66,8 +111,8 @@ def default_layer(n_layers: int) -> int:
 # Legacy alias; prefer default_layer(model.cfg.n_layers) after load.
 LAYER = 8
 
-# Minimum VRAM for GPU. 8B fp16 weights ~16 GB — needs T4 16GB or better; 1B ~6 GB.
-MIN_GPU_BYTES = 14 * 1024 ** 3 if _is_8b_model() else 6 * 1024 ** 3
+# Minimum VRAM for GPU selection (non-Colab). 3B ~6 GB; 8B needs 17+ GB.
+MIN_GPU_BYTES = 6 * 1024 ** 3
 
 # The trajectory text is followed by this cue; the answer-logit is read at the
 # final position (which predicts the first answer token). This is THE explicit
@@ -137,8 +182,8 @@ def log_device_choice() -> str:
 _MODEL_CACHE: dict[tuple[str, str, str], HookedTransformer] = {}
 
 
-def _cache_key(device: str, dtype: torch.dtype) -> tuple[str, str, str]:
-    return (MODEL_NAME, device, str(dtype))
+def _cache_key(tl_name: str, device: str, dtype: torch.dtype) -> tuple[str, str, str]:
+    return (tl_name, device, str(dtype))
 
 
 def _default_dtype(device: str) -> torch.dtype:
@@ -167,23 +212,11 @@ def load_model(device: str | None = None, dtype: torch.dtype | None = None) -> H
         dtype = getattr(torch, env_dtype) if env_dtype else _default_dtype(device)
 
     n_ctx = default_n_ctx()
-    key = _cache_key(device, dtype)
+    tl_name = effective_model_name(device)
+    key = _cache_key(tl_name, device, dtype)
     if key not in _MODEL_CACHE:
-        tl_name = resolve_model_name()
         print(f"Loading {tl_name} (n_ctx={n_ctx}, dtype={dtype}, device={device})...",
               flush=True)
-        if _is_8b_model(tl_name) and device == "cuda":
-            try:
-                vram = torch.cuda.get_device_properties(0).total_memory
-                if vram < 15 * 1024 ** 3:
-                    print(
-                        "Warning: 8B in fp16 needs ~16 GB VRAM. T4 is tight — "
-                        "try VERITAS_N_CTX=4096, A100/L4 runtime, or VERITAS_MODEL="
-                        "meta-llama/Llama-3.2-1B-Instruct.",
-                        flush=True,
-                    )
-            except Exception:
-                pass
         if dtype == torch.float32:
             model = HookedTransformer.from_pretrained(
                 tl_name, device=device, dtype=dtype, n_ctx=n_ctx

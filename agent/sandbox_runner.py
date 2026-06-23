@@ -26,7 +26,7 @@ from agent.sandbox_env import (
     initial_user_message,
     load_tasks,
 )
-from interp.activation_cache import MODEL_NAME, RESULTS_DIR, load_model
+from interp.activation_cache import RESULTS_DIR, load_model
 
 TRAJ_PATH = RESULTS_DIR / "trajectories.json"
 
@@ -170,7 +170,7 @@ def run_live_trajectory(model, task, seed: int = 0) -> dict | None:
     record = {
         "id": traj_id,
         "instance_id": task.id,
-        "model_name": MODEL_NAME,
+        "model_name": model.cfg.model_name,
         "source": "live_sandbox",
         "success": success,
         "finished": finished,
