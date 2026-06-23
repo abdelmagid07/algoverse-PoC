@@ -35,14 +35,30 @@ INCREASE_MARGIN = 0.10  # late-minus-early delta to count as "increasing"
 # comparison (C.3). HotpotQA trajectories were ~3 steps, too short to test the
 # early->late forecasting hypothesis; this is the baseline the SWE-bench
 # migration is meant to beat. Source: the HotpotQA probe summary.
-HOTPOTQA_BASELINE = {
-    "domain": "HotpotQA (~3 steps)",
-    "chance": 0.600,
-    "delta": -0.081,           # early->late delta (mean over layers)
-    "increasing_layers": 0,
+# Prior foreign-replay SWE-bench run (for A/B comparison in summary).
+REPLAY_BASELINE = {
+    "domain": "SWE-bench replay (foreign agent, 18 traj)",
+    "chance": 0.500,
+    "delta": -0.137,
+    "increasing_layers": 2,
     "n_layers": 16,
-    "band": "NO SIGNAL",
+    "band": "CAUTIOUS",
+    "note": "Replay measured Llama reading another agent's transcript — not self-forecasting.",
 }
+
+
+def _trajectory_source() -> str:
+    path = RESULTS_DIR / "trajectories.json"
+    if not path.exists():
+        return "unknown"
+    try:
+        trajs = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return "unknown"
+    sources = {t.get("source", "replay") for t in trajs}
+    if "live_sandbox" in sources:
+        return "live_sandbox"
+    return "replay"
 
 
 def _bin_layer_arrays(payload: dict):
@@ -166,32 +182,40 @@ def main() -> None:
         )
 
     band_label = {"strong": "STRONG", "cautious": "CAUTIOUS", "no_signal": "NO SIGNAL"}[c["band"]]
+    source = _trajectory_source()
+    is_live = source == "live_sandbox"
 
-    # --- HotpotQA vs. SWE-bench side-by-side (C.3) + interpretation (C.4) ----
-    hb = HOTPOTQA_BASELINE
+    # --- Prior replay vs this run (A/B) ---------------------------------------
+    prior = REPLAY_BASELINE
+    domain_this = "Live sandbox (Llama self-generated, 6-15 steps)" if is_live else "SWE-bench replay (foreign agent)"
     comparison_rows = "\n".join([
-        "| Metric | HotpotQA (prior) | SWE-bench Lite (this run) |",
+        "| Metric | Prior replay run | This run |",
         "|---|---|---|",
-        f"| Domain / length | {hb['domain']} | SWE-bench Lite (8-20 steps) |",
-        f"| Chance baseline | {hb['chance']:.3f} | {chance:.3f} |",
-        f"| Early->late delta (mean over layers) | {hb['delta']:+.3f} | {c['delta']:+.3f} |",
-        f"| Layers showing the increase | {hb['increasing_layers']}/{hb['n_layers']} | "
+        f"| Domain | {prior['domain']} | {domain_this} |",
+        f"| Chance baseline | {prior['chance']:.3f} | {chance:.3f} |",
+        f"| Early->late delta (mean over layers) | {prior['delta']:+.3f} | {c['delta']:+.3f} |",
+        f"| Layers showing the increase | {prior['increasing_layers']}/{prior['n_layers']} | "
         f"{c['increasing_layers']}/{payload['n_layers']} |",
-        f"| Decision band | {hb['band']} | {band_label} |",
+        f"| Decision band | {prior['band']} | {band_label} |",
     ])
-    if c["band"] == "no_signal":
+    if is_live:
         interpretation = (
-            "Still null at proper trajectory length. The prior HotpotQA null was "
-            "therefore **not** purely a length artifact - on longer SWE-bench "
-            "trajectories the outcome is still not linearly decodable from the "
-            "residual stream at this scale. This is a more trustworthy null."
+            "This run uses **Llama generating and executing** its own coding trajectories; "
+            "labels come from live hidden tests, not foreign transcripts. The research "
+            "question is whether decodability exists **somewhere** along the trajectory "
+            "(peak layer/bin), not whether it monotonically grows early→late. "
+            "Compare skepticism task-holdout and stripped-text baselines before trusting "
+            "activation signal."
+        )
+    elif c["band"] == "no_signal":
+        interpretation = (
+            "Still null at proper trajectory length. Outcome is not linearly decodable "
+            "from the residual stream at this scale."
         )
     else:
         interpretation = (
-            "Signal appears once trajectories are long enough. This is consistent "
-            "with the prior HotpotQA null being a **length artifact**: ~3-step "
-            "trajectories were too short for an early->late forecasting trend to "
-            "exist, while SWE-bench's longer horizon makes it measurable."
+            "Signal on replayed foreign trajectories — interpret with caution; see "
+            "foreign-replay caveat. Prefer live-sandbox results for self-forecasting claims."
         )
 
     imbalance_note = ""
@@ -209,6 +233,41 @@ def main() -> None:
             + SKEPTICISM_MD.read_text(encoding="utf-8").split("\n", 1)[-1].strip()
             + "\n"
         )
+
+    domain_label = "live Python sandbox" if is_live else "SWE-bench replay"
+    if is_live:
+        domain_caveats = f"""### Live sandbox caveats (flagged, not silently fixed)
+
+5. **Step-boundary convention.** One step = one `ai` (assistant) turn; its step
+   position is that turn's final token; `user`/`system` turns are observations,
+   not steps.
+6. **Observation truncation.** `user`/`system` observations are head-truncated to
+   a fixed token cap; `ai` turns are kept whole. Rare trajectories over `n_ctx`
+   after truncation are dropped (and logged).
+7. **Sandbox domain.** Single-file Python repairs in a temp directory — not real
+   SWE-bench repos or Docker eval. Success = hidden unit tests pass.
+8. **Same-agent generate + probe.** `{MODEL_NAME}` both acts and is probed; labels
+   reflect its own test outcomes. Still correlational, not causal.
+9. **Model capability.** Smaller models fail more tasks; class balance reflects
+   model ability. Tool JSON parsing may fail on small models. Default is 8B;
+   override with `VERITAS_MODEL` if VRAM is insufficient."""
+        reproduce = """```bash
+python run_pipeline.py          # live collect + probe + skepticism + summarize
+VERITAS_SMOKE_N=2 python run_pipeline.py   # quick smoke (2 trajectories)
+# legacy foreign replay:
+VERITAS_TRAJECTORY_SOURCE=replay python run_pipeline.py
+```"""
+    else:
+        domain_caveats = """### SWE-bench replay caveats (legacy mode)
+
+5. **Foreign-trajectory replay.** Trajectories were generated by other agents;
+   Llama reads their text. Labels come from dataset `target`, not live eval.
+6. **Step-boundary / truncation.** Same conventions as live sandbox (ai turn =
+   one step; observations truncated)."""
+        reproduce = """```bash
+VERITAS_TRAJECTORY_SOURCE=replay python run_pipeline.py
+python -m agent.swebench_loader
+```"""
 
     md = f"""# Latent Failure Forecasting PoC - Results Summary
 
@@ -238,11 +297,11 @@ accuracies; the per-cell cross-validation fold spread is in `probe_results.json`
 (`acc_std`). See `accuracy_by_position.png`, `accuracy_by_layer.png`, and
 `probe_heatmap.png`.
 
-## HotpotQA vs. SWE-bench (length-artifact check)
+## Prior replay vs. this run
 
-The PoC moved from HotpotQA to SWE-bench Lite specifically because HotpotQA
-trajectories were too short (~3 steps) to test "decodability grows as the agent
-nears its own answer." Same probe methodology, longer-horizon data:
+The prior PoC replayed **foreign** SWE-bench agent transcripts through Llama
+(measuring "can Llama decode another agent's outcome?"). This migration runs
+**Llama as the agent** in a lightweight coding sandbox when `source=live_sandbox`.
 
 {comparison_rows}
 
@@ -271,40 +330,14 @@ nears its own answer." Same probe methodology, longer-horizon data:
    both contribute to every bin, removing the "fewer examples at late steps"
    confound. Each trajectory contributes one mean-pooled row per bin.
 4. **PoC scope.** No causal validation, no SAE features, single domain
-   (SWE-bench Lite), logistic-regression probes only. This is a
+   ({domain_label}), logistic-regression probes only. This is a
    direction-validation PoC, not a publication-grade measurement.
 
-### SWE-bench migration caveats (flagged, not silently fixed)
-
-5. **Step-boundary convention.** One step = one `ai` (assistant) turn; its step
-   position is that turn's final token; `user`/`system` turns are observations,
-   not steps. This is a real choice - a different convention (e.g. splitting on
-   tool calls) could move reasoning across the early/mid/late bins and change the
-   trend.
-6. **Observation truncation.** The model is loaded with `n_ctx=8192`, so whole
-   8-20 step trajectories fit and no reasoning steps are dropped. Only `user`/
-   `system` observations (tool output, the issue text) are head-truncated to a
-   fixed token cap; `ai` reasoning/action turns are kept whole. This alters the
-   observation context the model reads. A rare trajectory still over `n_ctx`
-   after truncation is dropped (and logged), not silently clipped mid-sequence.
-7. **Foreign-trajectory replay.** The trajectories were generated by other
-   agents/models; we replay their text through `{MODEL_NAME}` and use the
-   dataset's own `target` label. So this measures "does {MODEL_NAME}'s internal
-   state while *reading* the trajectory encode the eventual outcome" - a proxy
-   for the proposal's "agent's own internal forecast," not a literal measurement
-   of it.
+{domain_caveats}
 
 ## Reproduce
 
-```bash
-python run_pipeline.py          # collect + probe + skepticism + visualize + summarize
-# or, step by step:
-python -m agent.swebench_loader # collect + replay + cache step-boundary activations
-python -m analysis.probe        # layer x relative-position probes (CV)
-python -m analysis.skepticism   # permutation / instance / text baselines
-python -m analysis.visualize_probe
-python -m analysis.summarize
-```
+{reproduce}
 """
     OUT_PATH.write_text(md, encoding="utf-8")
     print(f"Wrote {OUT_PATH}", flush=True)

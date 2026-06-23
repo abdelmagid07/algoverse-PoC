@@ -14,6 +14,7 @@ Run:  python -m analysis.skepticism
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 
 import numpy as np
@@ -39,6 +40,22 @@ EARLY_BIN = 0
 N_PERM = 300
 N_BOOT = 400
 MAX_TFIDF_FEATURES = 256
+_STRIP_PATTERNS = [
+    re.compile(r"fix_[a-z0-9_]+", re.I),
+    re.compile(r"solution\.py", re.I),
+    re.compile(r"\b[a-z_]+\.py\b", re.I),
+]
+
+
+def _strip_instance_cues(text: str, traj: dict) -> str:
+    """Remove task ids and filenames so text baseline is less instance-memorization."""
+    out = text
+    inst = str(traj.get("instance_id", ""))
+    if inst:
+        out = out.replace(inst, " ")
+    for pat in _STRIP_PATTERNS:
+        out = pat.sub(" ", out)
+    return " ".join(out.split())
 
 
 def _early_text(traj: dict) -> str:
@@ -75,6 +92,7 @@ def build_indexed_rows(trajectories: list[dict]) -> tuple[dict, int, int]:
             "instance_id": str(traj.get("instance_id", traj["id"])),
             "success": int(bool(traj["success"])),
             "early_text": _early_text(traj),
+            "early_text_stripped": _strip_instance_cues(_early_text(traj), traj),
         }
         seen_bins = set()
         for s in range(total):
@@ -137,7 +155,7 @@ def permutation_null_auc(X: np.ndarray, y: np.ndarray, n_perm: int, rng: np.rand
 
 
 def instance_holdout(X: np.ndarray, y: np.ndarray, groups: np.ndarray) -> dict:
-    """Leave-one-instance-out CV: test on trajectories from unseen SWE-bench tasks."""
+    """Leave-one-task-out CV: test on trajectories from unseen tasks."""
     n_groups = len(np.unique(groups))
     if n_groups < 2:
         return {"note": "need >= 2 instances for instance holdout", "acc_mean": None, "auc": None}
@@ -209,12 +227,18 @@ def _verdict(checks: dict) -> str:
     if hold.get("auc") is not None and hold["auc"] < 0.55:
         flags.append("instance holdout AUC weak (<0.55)")
     text = checks.get("text_baseline_early", {})
+    text_stripped = checks.get("text_baseline_stripped", {})
     act = checks.get("activation_early", {})
     if text.get("auc") is not None and act.get("auc") is not None:
         if text["auc"] >= act["auc"] - 0.03:
             flags.append("early text alone nearly matches activations")
         elif act["auc"] - text["auc"] >= 0.08:
             flags.append("activations beat text baseline (internal signal beyond issue text)")
+    if text_stripped.get("auc") is not None and act.get("auc") is not None:
+        if act["auc"] - text_stripped["auc"] >= 0.05:
+            flags.append("activations beat stripped-text baseline (beyond task-id wording)")
+        elif text_stripped["auc"] >= act["auc"] - 0.03:
+            flags.append("stripped early text still matches activations")
 
     if not flags:
         return (
@@ -231,7 +255,7 @@ def render_markdown(report: dict) -> str:
         "",
         f"Reference: early bin, layer {report['reference_layer']}, "
         f"n={report['n_trajectories']} trajectories, "
-        f"{report['n_instances']} distinct instances.",
+        f"{report['n_instances']} distinct tasks.",
         "",
         "## Results",
         "",
@@ -248,6 +272,11 @@ def render_markdown(report: dict) -> str:
         f"| Early text TF-IDF only | AUC | {txt.get('auc', 'n/a')} "
         f"(acc {txt.get('acc_mean', 'n/a')}) |"
     )
+    txt_s = c.get("text_baseline_stripped", {})
+    lines.append(
+        f"| Early text TF-IDF (stripped) | AUC | {txt_s.get('auc', 'n/a')} "
+        f"(acc {txt_s.get('acc_mean', 'n/a')}) |"
+    )
     perm = c["global_permutation"]
     lines.append(
         f"| Global label shuffle null | p-value | {perm.get('p_value', 'n/a')} "
@@ -261,7 +290,7 @@ def render_markdown(report: dict) -> str:
     )
     hold = c["instance_holdout"]
     lines.append(
-        f"| Instance holdout (LOIO) | AUC | {hold.get('auc', 'n/a')} "
+        f"| Task holdout (LOIO) | AUC | {hold.get('auc', 'n/a')} "
         f"(acc {hold.get('acc_mean', 'n/a')}) |"
     )
     boot = c["bootstrap_early"]
@@ -280,13 +309,15 @@ def render_markdown(report: dict) -> str:
         "",
         "- **Global permutation p-value**: fraction of shuffled-label runs with AUC "
         "≥ real. Low p → unlikely to be luck on N alone.",
-        "- **Within-instance shuffle**: permutes success/fail labels among attempts "
-        "at the *same* SWE-bench task. Large AUC drop → signal used instance-specific "
-        "structure; small drop → more about per-attempt dynamics.",
-        "- **Instance holdout**: train on 5 tasks, test on the 6th (leave-one-instance-out). "
-        "Strong AUC → generalizes across repos/issues.",
-        "- **Text baseline**: early `ai` step text only. If activation AUC ≫ text, "
-        "internal state adds signal beyond obvious wording.",
+        "- **Within-task shuffle**: permutes success/fail labels among attempts "
+        "at the *same* task. Large AUC drop → signal used task-specific "
+        "structure; small drop → more about per-attempt dynamics. "
+        "N/A when max_per_instance=1 (one attempt per task).",
+        "- **Task holdout (LOIO)**: train on N-1 tasks, test on the held-out task. "
+        "Strong AUC → generalizes across tasks.",
+        "- **Text baseline**: early `ai` step text only. Stripped variant removes "
+        "task ids and filenames. If activation AUC ≫ stripped text, internal "
+        "state adds signal beyond surface wording.",
     ])
     return "\n".join(lines) + "\n"
 
@@ -306,10 +337,12 @@ def main() -> None:
     y = np.array(labels[EARLY_BIN], dtype=int)
     groups = np.array([r["instance_id"] for r in rows[EARLY_BIN]])
     texts = [r["early_text"] for r in rows[EARLY_BIN]]
+    texts_stripped = [r["early_text_stripped"] for r in rows[EARLY_BIN]]
     rng = np.random.default_rng(RANDOM_STATE)
 
     activation_early = probe_one(X, y)
     text_early = text_baseline_early(texts, y)
+    text_stripped = text_baseline_early(texts_stripped, y)
     global_perm = permutation_null_auc(X, y, N_PERM, rng)
 
     real_auc = activation_early.get("auc")
@@ -326,10 +359,17 @@ def main() -> None:
     for r in rows[EARLY_BIN]:
         by_inst[r["instance_id"]].add(r["success"])
     n_mixed = sum(1 for s in by_inst.values() if len(s) > 1)
+    within_note = (
+        f"shuffle only permutes within tasks that have >= 2 attempts; "
+        f"{n_mixed}/{len(by_inst)} tasks have both success and fail."
+    )
+    if n_mixed == 0:
+        within_note += " With one attempt per task, within-task shuffle is a no-op."
 
     checks = {
         "activation_early": activation_early,
         "text_baseline_early": text_early,
+        "text_baseline_stripped": text_stripped,
         "global_permutation": global_perm,
         "within_instance_shuffle": {
             "real_auc": real_auc,
@@ -337,10 +377,7 @@ def main() -> None:
             "auc_drop": auc_drop,
             "n_instances": len(by_inst),
             "n_instances_with_both_labels": n_mixed,
-            "note": (
-                "shuffle only permutes within instances that have >= 2 attempts; "
-                f"{n_mixed}/{len(by_inst)} instances have both success and fail."
-            ),
+            "note": within_note,
         },
         "instance_holdout": holdout,
         "bootstrap_early": bootstrap,
@@ -362,6 +399,7 @@ def main() -> None:
     print(f"Skepticism checks (early bin, layer {ref_layer})", flush=True)
     print(f"  activation AUC: {activation_early.get('auc')}", flush=True)
     print(f"  text baseline AUC: {text_early.get('auc')}", flush=True)
+    print(f"  stripped text AUC: {text_stripped.get('auc')}", flush=True)
     print(f"  permutation p-value: {global_perm.get('p_value')}", flush=True)
     print(f"  within-instance shuffled AUC: {shuffled_auc} (drop {auc_drop})", flush=True)
     print(f"  instance holdout AUC: {holdout.get('auc')}", flush=True)

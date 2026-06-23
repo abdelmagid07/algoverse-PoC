@@ -16,9 +16,9 @@ import json
 import torch
 
 from interp.activation_cache import (
-    LAYER,
     RESULTS_DIR,
     answer_logit,
+    default_layer,
     load_model,
     resid_hook_name,
 )
@@ -27,8 +27,10 @@ TRAJ_PATH = RESULTS_DIR / "trajectories.json"
 OUT_PATH = RESULTS_DIR / "slow_scores.json"
 
 
-def ground_truth_patch_scores(model, trajectory: dict, layer: int = LAYER) -> list[float]:
+def ground_truth_patch_scores(model, trajectory: dict, layer: int | None = None) -> list[float]:
     """Zero-ablate each step's activation in turn; measure real logit change."""
+    if layer is None:
+        layer = default_layer(model.cfg.n_layers)
     tokens = torch.tensor([trajectory["token_ids"]], device=model.cfg.device)
     ans_pos = trajectory["answer_position"]
     gold_id = trajectory["gold_first_token_id"]
@@ -55,12 +57,13 @@ def ground_truth_patch_scores(model, trajectory: dict, layer: int = LAYER) -> li
 
 def main() -> None:
     model = load_model()
+    layer = default_layer(model.cfg.n_layers)
     with open(TRAJ_PATH, "r", encoding="utf-8") as f:
         trajectories = json.load(f)
 
     results = {}
     for traj in trajectories:
-        scores = ground_truth_patch_scores(model, traj, LAYER)
+        scores = ground_truth_patch_scores(model, traj, layer)
         results[traj["id"]] = scores
         print(f"  {traj['id']}: {[round(s, 3) for s in scores]}")
 

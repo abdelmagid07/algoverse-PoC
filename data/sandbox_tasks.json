@@ -1,0 +1,198 @@
+[
+  {
+    "id": "fix_sum_001",
+    "problem": "The function sum_list should return the sum of numbers in a list. It currently returns the wrong value.",
+    "starter_code": "def sum_list(xs):\n    total = 0\n    for x in xs:\n        total = x\n    return total\n",
+    "test_code": "from solution import sum_list\nassert sum_list([1, 2]) == 3\nassert sum_list([]) == 0\nassert sum_list([5]) == 5\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_max_002",
+    "problem": "max_of_two should return the larger of two integers. It returns the smaller one.",
+    "starter_code": "def max_of_two(a, b):\n    if a > b:\n        return b\n    return a\n",
+    "test_code": "from solution import max_of_two\nassert max_of_two(3, 7) == 7\nassert max_of_two(10, 2) == 10\nassert max_of_two(5, 5) == 5\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_abs_003",
+    "problem": "abs_val should return the absolute value of n. Negative inputs return wrong results.",
+    "starter_code": "def abs_val(n):\n    if n < 0:\n        return n\n    return n\n",
+    "test_code": "from solution import abs_val\nassert abs_val(-5) == 5\nassert abs_val(3) == 3\nassert abs_val(0) == 0\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_double_004",
+    "problem": "double should multiply a number by 2. It adds instead.",
+    "starter_code": "def double(n):\n    return n + 2\n",
+    "test_code": "from solution import double\nassert double(3) == 6\nassert double(0) == 0\nassert double(-4) == -8\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_is_even_005",
+    "problem": "is_even should return True when n is divisible by 2. Odd numbers incorrectly return True.",
+    "starter_code": "def is_even(n):\n    return n % 2 == 1\n",
+    "test_code": "from solution import is_even\nassert is_even(4) is True\nassert is_even(7) is False\nassert is_even(0) is True\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_len_str_006",
+    "problem": "first_char should return the first character of a non-empty string. It returns the last.",
+    "starter_code": "def first_char(s):\n    return s[-1]\n",
+    "test_code": "from solution import first_char\nassert first_char('hello') == 'h'\nassert first_char('a') == 'a'\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_add_007",
+    "problem": "add should add two integers. It subtracts instead.",
+    "starter_code": "def add(a, b):\n    return a - b\n",
+    "test_code": "from solution import add\nassert add(2, 3) == 5\nassert add(10, -4) == 6\nassert add(0, 0) == 0\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_mul_008",
+    "problem": "multiply should return the product of two numbers. It returns the sum.",
+    "starter_code": "def multiply(a, b):\n    return a + b\n",
+    "test_code": "from solution import multiply\nassert multiply(3, 4) == 12\nassert multiply(0, 5) == 0\nassert multiply(-2, 3) == -6\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_last_009",
+    "problem": "last_item should return the last element of a list. It returns the first.",
+    "starter_code": "def last_item(xs):\n    return xs[0]\n",
+    "test_code": "from solution import last_item\nassert last_item([1, 2, 3]) == 3\nassert last_item(['a']) == 'a'\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_count_010",
+    "problem": "count_items should return the length of a list. It always returns 0.",
+    "starter_code": "def count_items(xs):\n    return 0\n",
+    "test_code": "from solution import count_items\nassert count_items([1, 2]) == 2\nassert count_items([]) == 0\nassert count_items([1, 2, 3, 4]) == 4\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_square_011",
+    "problem": "square should return n squared. It returns n cubed.",
+    "starter_code": "def square(n):\n    return n * n * n\n",
+    "test_code": "from solution import square\nassert square(3) == 9\nassert square(0) == 0\nassert square(-2) == 4\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_sign_012",
+    "problem": "sign should return -1 for negative, 0 for zero, 1 for positive. Signs are flipped.",
+    "starter_code": "def sign(n):\n    if n < 0:\n        return 1\n    if n > 0:\n        return -1\n    return 0\n",
+    "test_code": "from solution import sign\nassert sign(-3) == -1\nassert sign(0) == 0\nassert sign(8) == 1\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_reverse_013",
+    "problem": "reverse_str should reverse a string. It returns the original string.",
+    "starter_code": "def reverse_str(s):\n    return s\n",
+    "test_code": "from solution import reverse_str\nassert reverse_str('abc') == 'cba'\nassert reverse_str('') == ''\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_min_014",
+    "problem": "min_of_two should return the smaller integer. It returns the larger.",
+    "starter_code": "def min_of_two(a, b):\n    if a < b:\n        return b\n    return a\n",
+    "test_code": "from solution import min_of_two\nassert min_of_two(3, 7) == 3\nassert min_of_two(10, 2) == 2\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_upper_015",
+    "problem": "to_upper should uppercase a string. It lowercases instead.",
+    "starter_code": "def to_upper(s):\n    return s.lower()\n",
+    "test_code": "from solution import to_upper\nassert to_upper('Hi') == 'HI'\nassert to_upper('abc') == 'ABC'\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_div_016",
+    "problem": "divide should return a // b for integers. It uses floating division.",
+    "starter_code": "def divide(a, b):\n    return a / b\n",
+    "test_code": "from solution import divide\nassert divide(7, 2) == 3\nassert divide(10, 5) == 2\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_range_sum_017",
+    "problem": "sum_range should sum integers from 1 to n inclusive. It stops one early.",
+    "starter_code": "def sum_range(n):\n    total = 0\n    for i in range(1, n):\n        total += i\n    return total\n",
+    "test_code": "from solution import sum_range\nassert sum_range(3) == 6\nassert sum_range(1) == 1\nassert sum_range(5) == 15\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_all_pos_018",
+    "problem": "all_positive should return True if every number in the list is > 0. Zero is treated as positive incorrectly.",
+    "starter_code": "def all_positive(xs):\n    for x in xs:\n        if x < 0:\n            return False\n    return True\n",
+    "test_code": "from solution import all_positive\nassert all_positive([1, 2, 3]) is True\nassert all_positive([1, 0, 2]) is False\nassert all_positive([]) is True\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_contains_019",
+    "problem": "contains should return True if target is in items. Membership check is wrong.",
+    "starter_code": "def contains(items, target):\n    for x in items:\n        if x == target:\n            return False\n    return True\n",
+    "test_code": "from solution import contains\nassert contains([1, 2, 3], 2) is True\nassert contains([1, 2, 3], 5) is False\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_clamp_020",
+    "problem": "clamp should bound x between low and high. Upper bound is ignored.",
+    "starter_code": "def clamp(x, low, high):\n    if x < low:\n        return low\n    return x\n",
+    "test_code": "from solution import clamp\nassert clamp(5, 0, 10) == 5\nassert clamp(-1, 0, 10) == 0\nassert clamp(15, 0, 10) == 10\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_repeat_021",
+    "problem": "repeat should return a string repeated n times. It repeats n-1 times.",
+    "starter_code": "def repeat(s, n):\n    out = ''\n    for _ in range(n - 1):\n        out += s\n    return out\n",
+    "test_code": "from solution import repeat\nassert repeat('ab', 3) == 'ababab'\nassert repeat('x', 1) == 'x'\nassert repeat('z', 0) == ''\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_is_pal_022",
+    "problem": "is_palindrome should return True for palindromes. Comparison direction is wrong.",
+    "starter_code": "def is_palindrome(s):\n    return s == s[1:][::-1]\n",
+    "test_code": "from solution import is_palindrome\nassert is_palindrome('aba') is True\nassert is_palindrome('ab') is False\nassert is_palindrome('') is True\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_unique_023",
+    "problem": "unique_count should count distinct elements in a list. Duplicates are overcounted.",
+    "starter_code": "def unique_count(xs):\n    return len(xs)\n",
+    "test_code": "from solution import unique_count\nassert unique_count([1, 1, 2]) == 2\nassert unique_count([]) == 0\nassert unique_count(['a', 'b', 'a']) == 2\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_avg_024",
+    "problem": "average should return the mean of a non-empty list of numbers. It divides by wrong count.",
+    "starter_code": "def average(xs):\n    return sum(xs) / (len(xs) - 1)\n",
+    "test_code": "from solution import average\nassert average([2, 4]) == 3.0\nassert average([10]) == 10.0\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_zip_sum_025",
+    "problem": "pairwise_sum should sum pairs from two equal-length lists. It zips incorrectly.",
+    "starter_code": "def pairwise_sum(a, b):\n    return [x + y for x, y in zip(a, a)]\n",
+    "test_code": "from solution import pairwise_sum\nassert pairwise_sum([1, 2], [3, 4]) == [4, 6]\nassert pairwise_sum([], []) == []\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_filter_026",
+    "problem": "keep_evens should return only even numbers from a list. Odd numbers are kept.",
+    "starter_code": "def keep_evens(xs):\n    return [x for x in xs if x % 2 == 1]\n",
+    "test_code": "from solution import keep_evens\nassert keep_evens([1, 2, 3, 4]) == [2, 4]\nassert keep_evens([1, 3]) == []\n",
+    "difficulty": "easy"
+  },
+  {
+    "id": "fix_capitalize_027",
+    "problem": "capitalize_words should capitalize the first letter of each word. Only first word is changed.",
+    "starter_code": "def capitalize_words(s):\n    parts = s.split(' ')\n    if not parts:\n        return s\n    parts[0] = parts[0].capitalize()\n    return ' '.join(parts)\n",
+    "test_code": "from solution import capitalize_words\nassert capitalize_words('hello world') == 'Hello World'\nassert capitalize_words('a') == 'A'\n",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fix_index_028",
+    "problem": "second_index should return the element at index 1. It uses index 2.",
+    "starter_code": "def second_index(xs):\n    return xs[2]\n",
+    "test_code": "from solution import second_index\nassert second_index([10, 20, 30]) == 20\nassert second_index(['a', 'b']) == 'b'\n",
+    "difficulty": "easy"
+  }
+]

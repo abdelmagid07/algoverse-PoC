@@ -18,28 +18,38 @@ import torch
 from transformer_lens import HookedTransformer
 
 # --- Shared constants ------------------------------------------------------
-# Instruction-tuned model: a base model (e.g. GPT-2) falls into repetition
-# loops and prompt echoes and never produces real multi-hop reasoning steps,
-# which makes the fast-vs-slow comparison a test on noise. Llama-3.2-1B-Instruct
-# actually follows the "reason in steps, then answer" instruction. Gated:
-# requires accepting the license + an HF token (see README).
-MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
+# Default: 8B instruct for stronger sandbox/SWE-style tool use. Override with
+# VERITAS_MODEL (e.g. meta-llama/Llama-3.2-1B-Instruct or
+# meta-llama/Meta-Llama-3.1-8B-Instruct). Gated: HF token + license acceptance.
+_DEFAULT_MODEL = "meta-llama/Llama-3.2-8B-Instruct"
+MODEL_NAME = os.environ.get("VERITAS_MODEL", _DEFAULT_MODEL)
 
-# Middle layer of Llama-3.2-1B (16 layers, 0..15). Middle layers tend to carry
-# the most task-relevant signal in prior mech-interp work.
+
+def _is_8b_model(name: str = MODEL_NAME) -> bool:
+    n = name.lower()
+    return "8b" in n or "-8-" in n
+
+
+def default_n_ctx(name: str = MODEL_NAME) -> int:
+    """Context window at load time. Default 8192 for long agent trajectories."""
+    if os.environ.get("VERITAS_N_CTX"):
+        return int(os.environ["VERITAS_N_CTX"])
+    return 8192
+
+
+N_CTX = default_n_ctx()
+
+
+def default_layer(n_layers: int) -> int:
+    """Middle layer index for patching / reference (scales with model size)."""
+    return n_layers // 2
+
+
+# Legacy alias; prefer default_layer(model.cfg.n_layers) after load.
 LAYER = 8
 
-# Context length override. TransformerLens caps Llama-3.2 at n_ctx=2048 by
-# default (its rotary tables are only precomputed that far), which truncated
-# SWE-bench trajectories. Llama-3.2 actually trains to 128k, so 8192 is safely
-# inside the trained range; we set it so long agent trajectories replay whole.
-N_CTX = 8192
-
-# Minimum VRAM to run on GPU. Attribution patching needs a backward pass, which
-# does not fit alongside a 1B model's activations in a small (4 GB) card, so we
-# fall back to CPU there. A Colab T4 (16 GB) clears this easily and is much
-# faster. Override explicitly with the VERITAS_DEVICE env var ("cuda"/"cpu").
-MIN_GPU_BYTES = 6 * 1024 ** 3
+# Minimum VRAM for GPU. 8B fp16 weights ~16 GB — needs T4 16GB or better; 1B ~6 GB.
+MIN_GPU_BYTES = 14 * 1024 ** 3 if _is_8b_model() else 6 * 1024 ** 3
 
 # The trajectory text is followed by this cue; the answer-logit is read at the
 # final position (which predicts the first answer token). This is THE explicit
@@ -106,12 +116,16 @@ def log_device_choice() -> str:
     return dev
 
 
-_MODEL_CACHE: dict[str, HookedTransformer] = {}
+_MODEL_CACHE: dict[tuple[str, str, str], HookedTransformer] = {}
+
+
+def _cache_key(device: str, dtype: torch.dtype) -> tuple[str, str, str]:
+    return (MODEL_NAME, device, str(dtype))
 
 
 def _default_dtype(device: str) -> torch.dtype:
     """Half precision on GPU to avoid the CPU-RAM spike that OOM-kills free
-    Colab during loading (a 1B model in fp32 briefly needs ~10 GB while
+    Colab during loading (8B fp16 ~16 GB weights; 1B fp32 spike ~10 GB while
     TransformerLens processes weights). fp32 on CPU for numerical stability."""
     if device == "cpu":
         return torch.float32
@@ -134,20 +148,34 @@ def load_model(device: str | None = None, dtype: torch.dtype | None = None) -> H
         env_dtype = os.environ.get("VERITAS_DTYPE")
         dtype = getattr(torch, env_dtype) if env_dtype else _default_dtype(device)
 
-    if device not in _MODEL_CACHE:
-        # n_ctx must be set at load time: rotary embedding buffers are sized
-        # during init, so mutating cfg.n_ctx afterwards would not resize them.
+    n_ctx = default_n_ctx()
+    key = _cache_key(device, dtype)
+    if key not in _MODEL_CACHE:
+        print(f"Loading {MODEL_NAME} (n_ctx={n_ctx}, dtype={dtype}, device={device})...",
+              flush=True)
+        if _is_8b_model() and device == "cuda":
+            try:
+                vram = torch.cuda.get_device_properties(0).total_memory
+                if vram < 15 * 1024 ** 3:
+                    print(
+                        "Warning: 8B in fp16 needs ~16 GB VRAM. T4 is tight — "
+                        "try VERITAS_N_CTX=4096, A100/L4 runtime, or VERITAS_MODEL="
+                        "meta-llama/Llama-3.2-1B-Instruct.",
+                        flush=True,
+                    )
+            except Exception:
+                pass
         if dtype == torch.float32:
             model = HookedTransformer.from_pretrained(
-                MODEL_NAME, device=device, dtype=dtype, n_ctx=N_CTX
+                MODEL_NAME, device=device, dtype=dtype, n_ctx=n_ctx
             )
         else:
             model = HookedTransformer.from_pretrained_no_processing(
-                MODEL_NAME, device=device, dtype=dtype, n_ctx=N_CTX
+                MODEL_NAME, device=device, dtype=dtype, n_ctx=n_ctx
             )
         model.eval()
-        _MODEL_CACHE[device] = model
-    return _MODEL_CACHE[device]
+        _MODEL_CACHE[key] = model
+    return _MODEL_CACHE[key]
 
 
 def resid_hook_name(layer: int = LAYER) -> str:

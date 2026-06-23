@@ -46,7 +46,14 @@ import re
 
 import torch
 
-from interp.activation_cache import RESULTS_DIR, load_model, save_activations
+from agent.replay_cache import (
+    OBS_TOKEN_CAP,
+    STEP_ROLE,
+    build_replay_tokens,
+    finalize_trajectory_from_turns,
+    max_context_tokens,
+)
+from interp.activation_cache import RESULTS_DIR, load_model
 
 DATASET = "nebius/swe-agent-trajectories"
 TRAJ_PATH = RESULTS_DIR / "trajectories.json"
@@ -58,22 +65,10 @@ TRAJ_PATH = RESULTS_DIR / "trajectories.json"
 MIN_STEPS = 8
 MAX_STEPS = 20
 
-# Observations are the memory hog (p90 ~1158 tok, max ~4000). Capping each to 256
-# tokens keeps a median trajectory well under budget; ai turns are left whole so
-# the reasoning that the probe reads is never clipped.
-OBS_TOKEN_CAP = 256
-# Hard ceiling: the model is loaded with n_ctx=8192 (interp/activation_cache.py),
-# which fits whole SWE-bench trajectories in the 8-20 step band. A rare
-# trajectory still over this after observation truncation is dropped with a
-# warning (reported, not silently clipped). Used as a fallback when the encoder
-# is called without a model handy.
-MAX_CONTEXT_TOKENS = 8192
-
 N_TRAJECTORIES = 18        # target collection size (roughly balanced)
 MAX_SCAN_ROWS = 4000       # cap on streamed rows while hunting for balance
 
 _OBS_ROLES = {"user", "system"}
-_STEP_ROLE = "ai"
 
 
 # --------------------------------------------------------------------------
@@ -98,7 +93,7 @@ def parse_row(row: dict, idx: int,
     for t in traj:
         role = t.get("role")
         text = (t.get("text") or "").strip()
-        if role == _STEP_ROLE:
+        if role == STEP_ROLE:
             if not text:  # skip empty assistant turns so step positions stay real
                 continue
             n_steps += 1
@@ -184,83 +179,9 @@ def load_swebench_trajectories(
 # --------------------------------------------------------------------------
 # Replay + compact activation caching (needs the model).
 # --------------------------------------------------------------------------
-def _max_context_tokens(model) -> int:
-    """The model is loaded with a raised n_ctx (8192); honor it as the ceiling."""
-    return int(getattr(model.cfg, "n_ctx", MAX_CONTEXT_TOKENS))
-
-
-def _to_ids(model, text: str) -> list[int]:
-    if not text:
-        return []
-    return model.to_tokens(text, prepend_bos=False)[0].tolist()
-
-
-def build_replay_tokens(model, turns: list[dict]):
-    """Concatenate turns into one token sequence, truncating only observations.
-
-    `ai` (assistant) turns — the reasoning the probe reads — are kept whole; only
-    `user`/`system` observations are head-truncated to OBS_TOKEN_CAP. With the
-    model loaded at n_ctx=8192, whole 8-20 step trajectories fit, so no steps are
-    dropped. Returns (token_ids, step_positions) where step_positions are the
-    absolute indices of each `ai` turn's final token, or (None, None) if the
-    sequence still exceeds n_ctx after observation truncation (then dropped).
-    """
-    max_tokens = _max_context_tokens(model)
-    bos = model.tokenizer.bos_token_id
-    ids: list[int] = [bos] if bos is not None else []
-    step_positions: list[int] = []
-
-    for turn in turns:
-        role = turn["role"]
-        # A short role tag keeps the replayed text readable as a conversation.
-        ids += _to_ids(model, f"\n\n{role}:\n")
-        body = _to_ids(model, turn["text"])
-        if role in _OBS_ROLES and len(body) > OBS_TOKEN_CAP:
-            body = body[:OBS_TOKEN_CAP]  # head-truncate observation (caveat #2)
-        ids += body
-        if role == _STEP_ROLE:
-            step_positions.append(len(ids) - 1)
-
-    if len(ids) > max_tokens:
-        return None, None
-    return ids, step_positions
-
-
 def replay_and_cache_activations(model, trajectory: dict) -> dict | None:
-    """Replay one trajectory and cache step-boundary resid_post for all layers.
-
-    Mutates and returns the trajectory record with the probe-facing fields
-    (step_positions=range(n_steps), activation_path, seq_len), and drops `turns`.
-    Returns None if the trajectory overflows n_ctx after observation truncation.
-    """
-    ids, abs_positions = build_replay_tokens(model, trajectory["turns"])
-    if ids is None:
-        print(f"  warning: {trajectory['id'][:24]} over {_max_context_tokens(model)} "
-              f"tokens after observation truncation — dropping.", flush=True)
-        return None
-
-    tokens = torch.tensor([ids], device=model.cfg.device)
-    names = [f"blocks.{l}.hook_resid_post" for l in range(model.cfg.n_layers)]
-    with torch.no_grad():
-        _, cache = model.run_with_cache(tokens, names_filter=lambda nm: nm in names)
-
-    # Keep only step-boundary rows: O(seq) -> O(n_steps) on disk and in RAM.
-    idx = torch.tensor(abs_positions, device=model.cfg.device)
-    compact = {nm: cache[nm][0].index_select(0, idx).detach().cpu().contiguous()
-               for nm in names}
-    path = save_activations(trajectory["id"], compact)
-
-    n_steps = len(abs_positions)
-    trajectory["step_positions"] = list(range(n_steps))   # probe indexes 0..n-1
-    trajectory["n_steps"] = n_steps
-    trajectory["seq_len"] = len(ids)
-    trajectory["activation_path"] = str(path)
-    # Keep short step previews for the qualitative read; drop bulky raw turns.
-    trajectory["step_texts"] = [
-        t["text"][:200] for t in trajectory["turns"] if t["role"] == _STEP_ROLE
-    ][:n_steps]
-    trajectory.pop("turns", None)
-    return trajectory
+    """Replay one trajectory and cache step-boundary resid_post for all layers."""
+    return finalize_trajectory_from_turns(model, trajectory, trajectory["turns"])
 
 
 def main() -> None:
