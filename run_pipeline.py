@@ -35,6 +35,7 @@ from agent.swebench_loader import (  # noqa: E402
     replay_and_cache_activations,
 )
 from analysis.probe import main as probe_main  # noqa: E402
+from analysis.skepticism import main as skepticism_main  # noqa: E402
 from analysis.summarize import main as summarize_main  # noqa: E402
 from analysis.visualize_probe import main as visualize_main  # noqa: E402
 from interp.activation_cache import RESULTS_DIR, load_model, log_device_choice  # noqa: E402
@@ -104,6 +105,8 @@ def main() -> None:
         phase1_collect(model)
         _log("\n=== Phase 2: probe (logistic regression by layer x position) ===")
         probe_main()
+        _log("\n=== Phase 2b: skepticism checks ===")
+        skepticism_main()
         _log("\n=== Phase 3: visualize ===")
         visualize_main()
         _log("\n=== Phase 4: summary ===")

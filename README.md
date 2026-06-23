@@ -71,6 +71,7 @@ pip install -r requirements.txt
 
 python -m agent.swebench_loader   # collect ~18 SWE-bench trajectories + cache step-boundary activations
 python -m analysis.probe          # logistic-regression probes (layer x position)
+python -m analysis.skepticism     # controls: permutation, instance holdout, text baseline
 python -m analysis.visualize_probe # heatmap + accuracy-by-position + accuracy-by-layer
 python -m analysis.summarize       # writes results/poc_summary.md
 ```
@@ -84,7 +85,7 @@ Or run all of it in one process with `python run_pipeline.py`. Then read
 agent/    swebench_loader.py: load + replay SWE-bench trajectories, cache step-boundary acts (new)
           runner.py / trace_logger.py: HotpotQA loop (legacy, unwired)
 interp/   model loading + residual-stream activation caching (reused)
-analysis/ probe.py, visualize_probe.py, summarize.py
+analysis/ probe.py, skepticism.py, visualize_probe.py, summarize.py
           (correlate.py / interp patching modules are Veritas legacy, unused)
 data/     cached activations (compact [n_steps, d_model] .pt per trajectory)
 results/  probe results, plots, and the PoC summary

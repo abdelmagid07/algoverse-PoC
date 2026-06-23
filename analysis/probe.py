@@ -112,8 +112,13 @@ def _folds_for(y: np.ndarray) -> int:
     return int(min(MAX_FOLDS, min_class))
 
 
-def probe_one(X: np.ndarray, y: np.ndarray) -> dict:
-    """Cross-validated probe for a single (layer, bin) cell."""
+def probe_one(X: np.ndarray, y: np.ndarray, cv=None, groups: np.ndarray | None = None) -> dict:
+    """Cross-validated probe for a single (layer, bin) cell.
+
+    Pass a custom sklearn CV splitter via `cv` (e.g. LeaveOneGroupOut for instance
+    holdout) and `groups` when the splitter needs them. Defaults to stratified
+    k-fold on trajectories.
+    """
     n = len(y)
     n_pos = int(y.sum())
     n_neg = int(n - n_pos)
@@ -130,24 +135,34 @@ def probe_one(X: np.ndarray, y: np.ndarray) -> dict:
         return out
 
     k = _folds_for(y)
-    if k < 2:
-        out["note"] = "too few per-class examples for CV"
-        return out
+    if cv is None:
+        if k < 2:
+            out["note"] = "too few per-class examples for CV"
+            return out
+        cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=RANDOM_STATE)
+        out["folds"] = int(k)
+    else:
+        out["folds"] = int(getattr(cv, "get_n_splits", lambda: 0)())
+        if out["folds"] < 2:
+            out["note"] = "CV splitter has fewer than 2 folds"
+            return out
 
     clf = make_pipeline(
         StandardScaler(),
         LogisticRegression(C=PROBE_C, max_iter=2000, penalty="l2"),
     )
-    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=RANDOM_STATE)
 
-    accs = cross_val_score(clf, X, y, cv=cv, scoring="accuracy")
+    accs = cross_val_score(clf, X, y, cv=cv, groups=groups, scoring="accuracy")
     out["acc_mean"] = float(accs.mean())
     out["acc_std"] = float(accs.std())
-    out["folds"] = int(k)
+    if groups is not None and out["folds"] == 0:
+        out["folds"] = len(accs)
 
     # Pooled out-of-fold AUC is more stable than averaging tiny per-fold AUCs.
     try:
-        proba = cross_val_predict(clf, X, y, cv=cv, method="predict_proba")[:, 1]
+        proba = cross_val_predict(
+            clf, X, y, cv=cv, groups=groups, method="predict_proba"
+        )[:, 1]
         out["auc"] = float(roc_auc_score(y, proba))
     except Exception as exc:  # pragma: no cover - defensive
         out["note"] = (out["note"] + f"; auc failed: {exc}").strip("; ")
